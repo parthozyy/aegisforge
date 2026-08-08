@@ -58,6 +58,18 @@ Add `src/scanner/result.rs` with focused domain types:
 - `DetectorStatus`: detector identity and explicit outcome.
 - `DetectorOutcome`: completed, skipped, not applicable, unavailable, or failed.
 
+Phase 1 diagnostic categories are `Discovery`, `Metadata`, `MachOHeader`, `MachODependencies`, and `Yara`. Reporter write errors are fatal I/O errors and are not stored as scan diagnostics. Phase 1 detector identities are `FileTypeMismatch`, `MachOHeader`, `MachODependencies`, `RiskyRpath`, and `Yara`.
+
+Detector outcomes have the following exact meaning:
+
+- `Completed`: the detector ran successfully, including when it produced no evidence.
+- `NotApplicable`: the artifact type is outside the detector's domain. All three Mach-O-specific checks use this for non-Mach-O artifacts.
+- `Skipped`: the detector did not run because a prerequisite was unavailable. `RiskyRpath` uses this when Mach-O dependency parsing failed.
+- `Failed`: the detector ran or attempted to run but returned an operational error. Mach-O header parsing, dependency parsing, and YARA scanning use this for their own failures.
+- `Unavailable`: a required external capability is unavailable. This outcome is reserved in the shared model for later native-trust phases and is not normally produced by Phase 1.
+
+`FileTypeMismatch` and `Yara` apply to every artifact with collected metadata. `MachOHeader` and `MachODependencies` apply only to Mach-O artifacts. `RiskyRpath` is completed after successful Mach-O dependency parsing, even if the binary has no RPATH entries or the detector emits no evidence.
+
 Diagnostic categories and detector identities use typed enums rather than arbitrary strings. Messages include the operation and affected path where relevant.
 
 The result model will derive the traits needed by tests and reporting. Serialization derives are deferred until the JSON module so this phase does not add unused dependencies.
@@ -71,6 +83,14 @@ Discovered paths will be sorted before analysis so text output and later JSON ou
 ### Artifact Analysis
 
 Each discovered file is analyzed independently. Failure to collect required artifact metadata prevents creation of an `ArtifactResult`; it adds a scan-level diagnostic and increments the failed count.
+
+Summary counts obey these invariants:
+
+- `discovered` is the number of paths returned by discovery.
+- `analyzed` is the number of successfully created `ArtifactResult` values.
+- `failed` is the number of discovered paths that failed before an `ArtifactResult` could be created.
+- `discovered == analyzed + failed`.
+- `unknown + suspicious + malicious == analyzed`.
 
 For a valid artifact:
 
@@ -86,7 +106,7 @@ The scanner processes one artifact at a time. Concurrency is outside this module
 
 Add `src/report/mod.rs` and `src/report/text.rs`. The reporter renders a `ScanResult` using the existing conceptual sections and wording: target, artifact identity, Mach-O details, dependencies, RPATHs, evidence, verdict, diagnostics, and summary.
 
-The scanner itself will not call `println!` or `eprintln!`. The text reporter may write to injected `Write` destinations so tests can verify stdout and stderr separately without spawning the binary.
+The scanner itself will not call `println!` or `eprintln!`. The text reporter writes normal scan content to an injected stdout writer and diagnostics to an injected stderr writer so tests can verify both streams without spawning the binary. Any reporter write failure is returned to the CLI as a fatal error and produces exit code 1.
 
 The default CLI output should remain recognizably compatible, but deterministic ordering and explicit diagnostic labels are permitted improvements.
 
