@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::detection::analyzer::analyze_artifact;
 use crate::detection::macho_dependency::classify_dependency;
+use crate::detection::rpath::classify_rpath;
 use crate::detection::verdict::determine_verdict;
 use crate::detection::yara::YaraEngine;
 
@@ -80,7 +81,9 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
                                 println!("Runtime search paths:");
 
                                 for rpath in &dependencies.rpaths {
-                                    println!("  - {rpath}");
+                                    let location = classify_rpath(rpath);
+
+                                    println!("  - {} [{}]", rpath, location.as_str());
                                 }
                             }
                         }
