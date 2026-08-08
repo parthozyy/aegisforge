@@ -9,7 +9,7 @@ use crate::detection::yara::YaraEngine;
 use super::discovery::discover_files;
 use super::file_type::ArtifactType;
 use super::macho::inspect_macho;
-use super::macho_dependencies::inspect_macho_dependencies;
+use super::macho_dependencies::{MachODependencies, inspect_macho_dependencies};
 use super::metadata::collect_metadata;
 use super::path::{PathType, inspect_path};
 
@@ -49,6 +49,8 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
 
                 println!("SHA-256: {}", artifact.sha256);
 
+                let mut macho_dependencies: Option<MachODependencies> = None;
+
                 if matches!(&artifact.file_type, ArtifactType::MachO) {
                     match inspect_macho(&artifact.path) {
                         Ok(info) => {
@@ -86,6 +88,8 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
                                     println!("  - {} [{}]", rpath, location.as_str());
                                 }
                             }
+
+                            macho_dependencies = Some(dependencies);
                         }
 
                         Err(error) => {
@@ -94,7 +98,7 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
                     }
                 }
 
-                match analyze_artifact(&artifact, &yara_engine) {
+                match analyze_artifact(&artifact, &yara_engine, macho_dependencies.as_ref()) {
                     Ok(evidence) => {
                         let verdict = determine_verdict(&evidence);
 

@@ -21,6 +21,7 @@ impl Severity {
 pub enum EvidenceKind {
     FileTypeMismatch,
     YaraRuleMatch,
+    RiskyRpath,
 }
 
 #[derive(Debug)]
