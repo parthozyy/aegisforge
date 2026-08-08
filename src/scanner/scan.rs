@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::detection::file_mismatch::detect_file_type_mismatch;
+
 use super::discovery::discover_files;
 use super::metadata::collect_metadata;
 use super::path::{PathType, inspect_path};
@@ -37,6 +39,14 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
                 );
 
                 println!("SHA-256: {}", artifact.sha256);
+
+                if let Some(evidence) = detect_file_type_mismatch(&artifact) {
+                    println!(
+                        "Evidence [{}]: {}",
+                        evidence.severity.as_str(),
+                        evidence.message
+                    );
+                }
             }
 
             Err(error) => {
