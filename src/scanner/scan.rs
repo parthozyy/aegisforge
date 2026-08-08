@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::detection::analyzer::analyze_artifact;
+use crate::detection::verdict::determine_verdict;
 
 use super::discovery::discover_files;
 use super::metadata::collect_metadata;
@@ -42,13 +43,17 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
 
                 let evidence = analyze_artifact(&artifact);
 
-                for finding in evidence {
+                let verdict = determine_verdict(&evidence);
+
+                for finding in &evidence {
                     println!(
                         "Evidence [{}]: {}",
                         finding.severity.as_str(),
                         finding.message
                     );
                 }
+
+                println!("Verdict: {}", verdict.as_str());
             }
 
             Err(error) => {
