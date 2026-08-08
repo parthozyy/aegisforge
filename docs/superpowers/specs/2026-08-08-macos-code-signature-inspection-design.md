@@ -182,7 +182,7 @@ The existing artifact summary counts only discovered files. Bundle-signature tar
 
 ### Scanner Integration
 
-Mach-O signature inspection runs only after the artifact has been safely collected and classified from its immutable snapshot. Application bundle inspection uses the separately discovered bundle roots. Signature results are sorted by target path and then target kind.
+The scanner completes static collection, hashing, type/Mach-O parsing, YARA, evidence assembly, and verdict calculation for every discovered file before invoking any native trust command. During that artifact loop it records recognized Mach-O paths as pending signature targets. Only after the complete static artifact loop does it inspect the pending Mach-O targets followed by the separately discovered application bundle roots. Signature results are sorted by target path and then target kind.
 
 One signature failure never aborts later artifacts or bundles. Native failures are represented in the inspection and as `CodeSignature` diagnostics. Existing YARA, structural evidence, and verdicts are preserved exactly.
 
