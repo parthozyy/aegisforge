@@ -34,6 +34,8 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
                     artifact.size,
                     extension
                 );
+
+                println!("SHA-256: {}", artifact.sha256);
             }
 
             Err(error) => {
