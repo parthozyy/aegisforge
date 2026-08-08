@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 
 pub enum PathType {
@@ -6,15 +7,21 @@ pub enum PathType {
 }
 
 pub fn inspect_path(path: &Path) -> Result<PathType, String> {
-    if !path.exists() {
-        return Err(format!("Path does not exist: {}", path.display()));
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("Cannot inspect {}: {}", path.display(), error))?;
+
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Symbolic links are not supported: {}",
+            path.display()
+        ));
     }
 
-    if path.is_file() {
+    if metadata.is_file() {
         return Ok(PathType::File);
     }
 
-    if path.is_dir() {
+    if metadata.is_dir() {
         return Ok(PathType::Directory);
     }
 
