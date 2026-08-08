@@ -1,25 +1,7 @@
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+mod cli;
 
-#[derive(Parser)]
-#[command(
-    name = "af",
-    version,
-    about = "A lightweight, local-first security utility for macOS"
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Scan a file or directory
-    Scan {
-        /// Path to the file or directory to scan
-        path: PathBuf,
-    },
-}
+use clap::Parser;
+use cli::{Cli, Commands};
 
 fn main() {
     let cli = Cli::parse();
