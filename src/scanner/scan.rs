@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use super::discovery::discover_files;
+use super::metadata::collect_metadata;
 use super::path::{PathType, inspect_path};
 
 pub fn scan_path(path: &Path) -> Result<(), String> {
@@ -23,7 +24,22 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
     let files = discover_files(path)?;
 
     for file in &files {
-        println!("{}", file.display());
+        match collect_metadata(file) {
+            Ok(artifact) => {
+                let extension = artifact.extension.as_deref().unwrap_or("none");
+
+                println!(
+                    "{} | {} bytes | extension: {}",
+                    artifact.path.display(),
+                    artifact.size,
+                    extension
+                );
+            }
+
+            Err(error) => {
+                eprintln!("Warning: {error}");
+            }
+        }
     }
 
     println!("\n{} file(s) discovered", files.len());
