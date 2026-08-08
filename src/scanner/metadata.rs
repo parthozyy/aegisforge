@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use super::artifact::Artifact;
+use super::file_type::detect_file_type;
 use super::hashing::calculate_sha256;
 
 pub fn collect_metadata(path: &Path) -> Result<Artifact, String> {
@@ -17,5 +18,13 @@ pub fn collect_metadata(path: &Path) -> Result<Artifact, String> {
 
     let sha256 = calculate_sha256(path)?;
 
-    Ok(Artifact::new(path.to_path_buf(), size, extension, sha256))
+    let file_type = detect_file_type(path)?;
+
+    Ok(Artifact::new(
+        path.to_path_buf(),
+        size,
+        extension,
+        sha256,
+        file_type,
+    ))
 }

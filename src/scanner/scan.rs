@@ -29,10 +29,11 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
                 let extension = artifact.extension.as_deref().unwrap_or("none");
 
                 println!(
-                    "{} | {} bytes | extension: {}",
+                    "{} | {} bytes | extension: {} | type: {}",
                     artifact.path.display(),
                     artifact.size,
-                    extension
+                    extension,
+                    artifact.file_type.as_str()
                 );
 
                 println!("SHA-256: {}", artifact.sha256);
