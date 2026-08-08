@@ -40,11 +40,13 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
 
                 println!("SHA-256: {}", artifact.sha256);
 
-                if let Some(evidence) = detect_file_type_mismatch(&artifact) {
+                let evidence = detect_file_type_mismatch(&artifact);
+
+                for finding in evidence {
                     println!(
                         "Evidence [{}]: {}",
-                        evidence.severity.as_str(),
-                        evidence.message
+                        finding.severity.as_str(),
+                        finding.message
                     );
                 }
             }
