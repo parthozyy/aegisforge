@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::detection::file_mismatch::detect_file_type_mismatch;
+use crate::detection::analyzer::analyze_artifact;
 
 use super::discovery::discover_files;
 use super::metadata::collect_metadata;
@@ -40,7 +40,7 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
 
                 println!("SHA-256: {}", artifact.sha256);
 
-                let evidence = detect_file_type_mismatch(&artifact);
+                let evidence = analyze_artifact(&artifact);
 
                 for finding in evidence {
                     println!(
