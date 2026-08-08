@@ -5,6 +5,8 @@ use crate::detection::verdict::determine_verdict;
 use crate::detection::yara::YaraEngine;
 
 use super::discovery::discover_files;
+use super::file_type::ArtifactType;
+use super::macho::inspect_macho;
 use super::metadata::collect_metadata;
 use super::path::{PathType, inspect_path};
 
@@ -43,6 +45,23 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
                 );
 
                 println!("SHA-256: {}", artifact.sha256);
+
+                if matches!(&artifact.file_type, ArtifactType::MachO) {
+                    match inspect_macho(&artifact.path) {
+                        Ok(info) => {
+                            let architecture = info.architecture.as_deref().unwrap_or("multiple");
+
+                            println!(
+                                "Mach-O: {} | architecture: {} | endianness: {}",
+                                info.format, architecture, info.endianness
+                            );
+                        }
+
+                        Err(error) => {
+                            eprintln!("Warning: {error}");
+                        }
+                    }
+                }
 
                 match analyze_artifact(&artifact, &yara_engine) {
                     Ok(evidence) => {
