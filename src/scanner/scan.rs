@@ -7,6 +7,7 @@ use crate::detection::yara::YaraEngine;
 use super::discovery::discover_files;
 use super::file_type::ArtifactType;
 use super::macho::inspect_macho;
+use super::macho_dependencies::inspect_macho_dependencies;
 use super::metadata::collect_metadata;
 use super::path::{PathType, inspect_path};
 
@@ -55,6 +56,30 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
                                 "Mach-O: {} | architecture: {} | endianness: {}",
                                 info.format, architecture, info.endianness
                             );
+                        }
+
+                        Err(error) => {
+                            eprintln!("Warning: {error}");
+                        }
+                    }
+
+                    match inspect_macho_dependencies(&artifact.path) {
+                        Ok(dependencies) => {
+                            if !dependencies.libraries.is_empty() {
+                                println!("Linked libraries:");
+
+                                for library in &dependencies.libraries {
+                                    println!("  - {library}");
+                                }
+                            }
+
+                            if !dependencies.rpaths.is_empty() {
+                                println!("Runtime search paths:");
+
+                                for rpath in &dependencies.rpaths {
+                                    println!("  - {rpath}");
+                                }
+                            }
                         }
 
                         Err(error) => {

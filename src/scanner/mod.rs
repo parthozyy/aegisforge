@@ -3,6 +3,7 @@ pub mod discovery;
 pub mod file_type;
 pub mod hashing;
 pub mod macho;
+pub mod macho_dependencies;
 pub mod metadata;
 pub mod path;
 pub mod scan;

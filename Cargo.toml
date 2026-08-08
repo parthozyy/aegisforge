@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
+goblin = "0.10.7"
 hex = "0.4.3"
 sha2 = "0.11.0"
 yara-x = "1.19.0"
