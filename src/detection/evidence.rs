@@ -20,6 +20,7 @@ impl Severity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceKind {
     FileTypeMismatch,
+    YaraRuleMatch,
 }
 
 #[derive(Debug)]

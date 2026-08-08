@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::detection::analyzer::analyze_artifact;
 use crate::detection::verdict::determine_verdict;
+use crate::detection::yara::YaraEngine;
 
 use super::discovery::discover_files;
 use super::metadata::collect_metadata;
@@ -24,6 +25,8 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
         }
     }
 
+    let yara_engine = YaraEngine::from_directory(Path::new("rules/yara"))?;
+
     let files = discover_files(path)?;
 
     for file in &files {
@@ -41,19 +44,25 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
 
                 println!("SHA-256: {}", artifact.sha256);
 
-                let evidence = analyze_artifact(&artifact);
+                match analyze_artifact(&artifact, &yara_engine) {
+                    Ok(evidence) => {
+                        let verdict = determine_verdict(&evidence);
 
-                let verdict = determine_verdict(&evidence);
+                        for finding in &evidence {
+                            println!(
+                                "Evidence [{}]: {}",
+                                finding.severity.as_str(),
+                                finding.message
+                            );
+                        }
 
-                for finding in &evidence {
-                    println!(
-                        "Evidence [{}]: {}",
-                        finding.severity.as_str(),
-                        finding.message
-                    );
+                        println!("Verdict: {}", verdict.as_str());
+                    }
+
+                    Err(error) => {
+                        eprintln!("Warning: {error}");
+                    }
                 }
-
-                println!("Verdict: {}", verdict.as_str());
             }
 
             Err(error) => {
