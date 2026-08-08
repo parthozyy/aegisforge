@@ -3,6 +3,8 @@ pub enum Severity {
     Low,
     Medium,
     High,
+    /// Reserved for future detectors that can establish critical-confidence evidence.
+    #[allow(dead_code)]
     Critical,
 }
 
@@ -24,7 +26,7 @@ pub enum EvidenceKind {
     RiskyRpath,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evidence {
     pub kind: EvidenceKind,
     pub severity: Severity,

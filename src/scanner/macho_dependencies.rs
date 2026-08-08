@@ -1,19 +1,15 @@
-use std::fs;
 use std::path::Path;
 
 use goblin::mach::{Mach, MachO, SingleArch};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachODependencies {
     pub libraries: Vec<String>,
     pub rpaths: Vec<String>,
 }
 
-pub fn inspect_macho_dependencies(path: &Path) -> Result<MachODependencies, String> {
-    let data = fs::read(path)
-        .map_err(|error| format!("Failed to read Mach-O file {}: {}", path.display(), error))?;
-
-    let mach = Mach::parse(&data)
+pub fn inspect_macho_dependencies(data: &[u8], path: &Path) -> Result<MachODependencies, String> {
+    let mach = Mach::parse(data)
         .map_err(|error| format!("Failed to parse Mach-O file {}: {}", path.display(), error))?;
 
     let mut libraries = Vec::new();

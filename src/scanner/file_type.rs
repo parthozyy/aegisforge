@@ -1,8 +1,4 @@
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
-
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactType {
     MachO,
     Elf,
@@ -33,58 +29,47 @@ impl ArtifactType {
     }
 }
 
-pub fn detect_file_type(path: &Path) -> Result<ArtifactType, String> {
-    let mut file = File::open(path)
-        .map_err(|error| format!("Failed to open {}: {}", path.display(), error))?;
-
-    let mut buffer = [0u8; 16];
-
-    let bytes_read = file
-        .read(&mut buffer)
-        .map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
-
-    let bytes = &buffer[..bytes_read];
-
+pub fn detect_file_type(bytes: &[u8]) -> ArtifactType {
     if is_macho(bytes) {
-        return Ok(ArtifactType::MachO);
+        return ArtifactType::MachO;
     }
 
     if bytes.starts_with(b"\x7FELF") {
-        return Ok(ArtifactType::Elf);
+        return ArtifactType::Elf;
     }
 
     if bytes.starts_with(b"MZ") {
-        return Ok(ArtifactType::Pe);
+        return ArtifactType::Pe;
     }
 
     if bytes.starts_with(b"%PDF-") {
-        return Ok(ArtifactType::Pdf);
+        return ArtifactType::Pdf;
     }
 
     if bytes.starts_with(b"PK\x03\x04")
         || bytes.starts_with(b"PK\x05\x06")
         || bytes.starts_with(b"PK\x07\x08")
     {
-        return Ok(ArtifactType::Zip);
+        return ArtifactType::Zip;
     }
 
     if bytes.starts_with(b"xar!") {
-        return Ok(ArtifactType::Xar);
+        return ArtifactType::Xar;
     }
 
     if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
-        return Ok(ArtifactType::Png);
+        return ArtifactType::Png;
     }
 
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return Ok(ArtifactType::Jpeg);
+        return ArtifactType::Jpeg;
     }
 
     if bytes.starts_with(b"#!") {
-        return Ok(ArtifactType::Script);
+        return ArtifactType::Script;
     }
 
-    Ok(ArtifactType::Unknown)
+    ArtifactType::Unknown
 }
 
 fn is_macho(bytes: &[u8]) -> bool {

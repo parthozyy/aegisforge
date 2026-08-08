@@ -8,6 +8,7 @@ pub struct YaraEngine {
 }
 
 impl YaraEngine {
+    #[cfg(test)]
     pub fn from_source(source: &str) -> Result<Self, String> {
         let mut compiler = Compiler::new();
 
@@ -86,18 +87,6 @@ impl YaraEngine {
             .collect();
 
         Ok(matches)
-    }
-
-    pub fn scan_file(&self, path: &Path) -> Result<Vec<String>, String> {
-        let data = fs::read(path).map_err(|error| {
-            format!(
-                "Failed to read {} for YARA scanning: {}",
-                path.display(),
-                error
-            )
-        })?;
-
-        self.scan_bytes(&data)
     }
 }
 

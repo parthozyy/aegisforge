@@ -1,28 +1,11 @@
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
-
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachOInfo {
     pub format: String,
     pub architecture: Option<String>,
     pub endianness: String,
 }
 
-pub fn inspect_macho(path: &Path) -> Result<MachOInfo, String> {
-    let mut file = File::open(path)
-        .map_err(|error| format!("Failed to open {}: {}", path.display(), error))?;
-
-    let mut buffer = [0u8; 8];
-
-    let bytes_read = file
-        .read(&mut buffer)
-        .map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
-
-    inspect_macho_bytes(&buffer[..bytes_read])
-}
-
-fn inspect_macho_bytes(bytes: &[u8]) -> Result<MachOInfo, String> {
+pub fn inspect_macho(bytes: &[u8]) -> Result<MachOInfo, String> {
     if bytes.len() < 4 {
         return Err("File is too small to contain a Mach-O header".to_string());
     }
@@ -129,7 +112,7 @@ mod tests {
     fn detects_arm64_macho() {
         let bytes = [0xCF, 0xFA, 0xED, 0xFE, 0x0C, 0x00, 0x00, 0x01];
 
-        let info = inspect_macho_bytes(&bytes).unwrap();
+        let info = inspect_macho(&bytes).unwrap();
 
         assert_eq!(info.format, "64-bit");
         assert_eq!(info.architecture.as_deref(), Some("arm64"));
@@ -140,7 +123,7 @@ mod tests {
     fn detects_x86_64_macho() {
         let bytes = [0xCF, 0xFA, 0xED, 0xFE, 0x07, 0x00, 0x00, 0x01];
 
-        let info = inspect_macho_bytes(&bytes).unwrap();
+        let info = inspect_macho(&bytes).unwrap();
 
         assert_eq!(info.format, "64-bit");
         assert_eq!(info.architecture.as_deref(), Some("x86_64"));
@@ -150,7 +133,7 @@ mod tests {
     fn detects_universal_binary() {
         let bytes = [0xCA, 0xFE, 0xBA, 0xBE];
 
-        let info = inspect_macho_bytes(&bytes).unwrap();
+        let info = inspect_macho(&bytes).unwrap();
 
         assert_eq!(info.format, "Universal");
         assert!(info.architecture.is_none());

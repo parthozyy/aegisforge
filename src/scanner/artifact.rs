@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use super::file_type::ArtifactType;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Artifact {
     pub path: PathBuf,
     pub size: u64,

@@ -1,8 +1,7 @@
-use super::evidence::{Evidence, EvidenceKind, Severity};
+use super::evidence::{Evidence, Severity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    Clean,
     Suspicious,
     Malicious,
     Unknown,
@@ -11,7 +10,6 @@ pub enum Verdict {
 impl Verdict {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Verdict::Clean => "CLEAN",
             Verdict::Suspicious => "SUSPICIOUS",
             Verdict::Malicious => "MALICIOUS",
             Verdict::Unknown => "UNKNOWN",
@@ -56,6 +54,8 @@ pub fn determine_verdict(evidence: &[Evidence]) -> Verdict {
 
 #[cfg(test)]
 mod tests {
+    use crate::detection::evidence::EvidenceKind;
+
     use super::*;
 
     fn evidence_with_severity(severity: Severity) -> Evidence {
