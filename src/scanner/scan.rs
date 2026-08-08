@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::detection::analyzer::analyze_artifact;
+use crate::detection::macho_dependency::classify_dependency;
 use crate::detection::verdict::determine_verdict;
 use crate::detection::yara::YaraEngine;
 
@@ -69,7 +70,9 @@ pub fn scan_path(path: &Path) -> Result<(), String> {
                                 println!("Linked libraries:");
 
                                 for library in &dependencies.libraries {
-                                    println!("  - {library}");
+                                    let location = classify_dependency(library);
+
+                                    println!("  - {} [{}]", library, location.as_str());
                                 }
                             }
 
