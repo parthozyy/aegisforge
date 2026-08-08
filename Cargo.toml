@@ -1,0 +1,11 @@
+[package]
+name = "aegisforge"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight, local-first security utility for macOS"
+
+[[bin]]
+name = "af"
+path = "src/main.rs"
+
+[dependencies]
