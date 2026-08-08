@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::detection::evidence::Evidence;
 use crate::detection::verdict::Verdict;
+use crate::macos::codesign::CodeSignatureInspection;
 
 use super::artifact::Artifact;
 use super::macho::MachOInfo;
@@ -14,6 +15,7 @@ pub enum DiagnosticKind {
     Metadata,
     MachOHeader,
     MachODependencies,
+    CodeSignature,
     Yara,
 }
 
@@ -118,6 +120,7 @@ pub struct ScanResult {
     pub target: PathBuf,
     pub target_type: PathType,
     pub artifacts: Vec<ArtifactResult>,
+    pub code_signatures: Vec<CodeSignatureInspection>,
     pub diagnostics: Vec<ScanDiagnostic>,
     pub summary: ScanSummary,
 }
@@ -128,6 +131,7 @@ mod tests {
 
     use super::*;
     use crate::detection::verdict::Verdict;
+    use crate::macos::codesign::{CodeSignatureInspection, CodeSignatureTargetKind};
     use crate::scanner::artifact::Artifact;
     use crate::scanner::file_type::ArtifactType;
 
@@ -173,5 +177,35 @@ mod tests {
 
         assert_eq!(status.detector, Detector::Yara);
         assert_eq!(status.outcome, DetectorOutcome::Failed);
+    }
+
+    #[test]
+    fn code_signature_diagnostic_kind_is_distinct() {
+        assert_ne!(DiagnosticKind::CodeSignature, DiagnosticKind::Discovery);
+        assert_ne!(DiagnosticKind::CodeSignature, DiagnosticKind::Metadata);
+        assert_ne!(DiagnosticKind::CodeSignature, DiagnosticKind::MachOHeader);
+        assert_ne!(
+            DiagnosticKind::CodeSignature,
+            DiagnosticKind::MachODependencies
+        );
+        assert_ne!(DiagnosticKind::CodeSignature, DiagnosticKind::Yara);
+    }
+
+    #[test]
+    fn scan_result_collects_typed_code_signature_inspections() {
+        let inspection = CodeSignatureInspection::unknown(
+            PathBuf::from("sample"),
+            CodeSignatureTargetKind::MachOFile,
+        );
+        let result = ScanResult {
+            target: PathBuf::from("sample"),
+            target_type: PathType::File,
+            artifacts: Vec::new(),
+            code_signatures: vec![inspection.clone()],
+            diagnostics: Vec::new(),
+            summary: ScanSummary::from_artifacts(0, &[]),
+        };
+
+        assert_eq!(result.code_signatures, vec![inspection]);
     }
 }

@@ -1,5 +1,6 @@
 mod cli;
 mod detection;
+mod macos;
 mod report;
 mod scanner;
 
@@ -69,6 +70,7 @@ mod tests {
             target: PathBuf::from("sample"),
             target_type: PathType::File,
             artifacts: Vec::new(),
+            code_signatures: Vec::new(),
             diagnostics: Vec::new(),
             summary: ScanSummary {
                 discovered: 0,

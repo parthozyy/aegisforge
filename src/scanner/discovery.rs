@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,6 +7,7 @@ use super::result::{DiagnosticKind, ScanDiagnostic};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryResult {
     pub files: Vec<PathBuf>,
+    pub app_bundles: Vec<PathBuf>,
     pub diagnostics: Vec<ScanDiagnostic>,
 }
 
@@ -23,6 +25,7 @@ pub fn discover_files_with_diagnostics(path: &Path) -> Result<DiscoveryResult, S
     if metadata.is_file() {
         return Ok(DiscoveryResult {
             files: vec![path.to_path_buf()],
+            app_bundles: Vec::new(),
             diagnostics: Vec::new(),
         });
     }
@@ -32,17 +35,36 @@ pub fn discover_files_with_diagnostics(path: &Path) -> Result<DiscoveryResult, S
     }
 
     let mut files = Vec::new();
+    let mut app_bundles = Vec::new();
     let mut diagnostics = Vec::new();
 
-    discover_directory(path, &mut files, &mut diagnostics);
-    files.sort();
+    if is_application_bundle(path) {
+        app_bundles.push(path.to_path_buf());
+    }
 
-    Ok(DiscoveryResult { files, diagnostics })
+    discover_directory(path, &mut files, &mut app_bundles, &mut diagnostics);
+    files.sort();
+    files.dedup();
+    app_bundles.sort();
+    app_bundles.dedup();
+
+    Ok(DiscoveryResult {
+        files,
+        app_bundles,
+        diagnostics,
+    })
+}
+
+fn is_application_bundle(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
 }
 
 fn discover_directory(
     directory: &Path,
     files: &mut Vec<PathBuf>,
+    app_bundles: &mut Vec<PathBuf>,
     diagnostics: &mut Vec<ScanDiagnostic>,
 ) {
     let entries = match fs::read_dir(directory) {
@@ -102,7 +124,11 @@ fn discover_directory(
         if file_type.is_file() {
             files.push(path);
         } else if file_type.is_dir() {
-            discover_directory(&path, files, diagnostics);
+            if is_application_bundle(&path) {
+                app_bundles.push(path.clone());
+            }
+
+            discover_directory(&path, files, app_bundles, diagnostics);
         }
     }
 }
@@ -194,6 +220,45 @@ mod tests {
     }
 
     #[test]
+    fn direct_top_level_application_bundle_is_discovered_once_with_its_contents() {
+        let fixture = TestDirectory::new();
+        let bundle = fixture.create_dir("Root.app");
+        let executable = fixture.create_file("Root.app/Contents/MacOS/main");
+        let resource = fixture.create_file("Root.app/Contents/Resources/data");
+
+        let result = discover_files_with_diagnostics(&bundle).expect("discovery should work");
+
+        assert_eq!(result.app_bundles, [bundle]);
+        assert_eq!(result.files, [executable, resource]);
+    }
+
+    #[test]
+    fn nested_application_bundles_are_case_insensitive_sorted_and_unique() {
+        let fixture = TestDirectory::new();
+        let root_bundle = fixture.create_dir("Root.app");
+        let root_executable = fixture.create_file("Root.app/Contents/MacOS/main");
+        let root_resource = fixture.create_file("Root.app/Contents/Resources/data");
+        let helper_bundle = fixture.create_dir("nested/Helper.APP");
+        let helper_executable = fixture.create_file("nested/Helper.APP/Contents/MacOS/helper");
+        fixture.create_dir("ordinary");
+        let ordinary_file = fixture.create_file("ordinary/file.txt");
+
+        let result =
+            discover_files_with_diagnostics(fixture.path()).expect("discovery should work");
+
+        assert_eq!(result.app_bundles, [root_bundle, helper_bundle]);
+        assert_eq!(
+            result.files,
+            [
+                root_executable,
+                root_resource,
+                helper_executable,
+                ordinary_file,
+            ]
+        );
+    }
+
+    #[test]
     fn directory_entry_error_diagnostic_names_containing_directory() {
         let directory = Path::new("nested");
         let error = std::io::Error::other("synthetic entry error");
@@ -222,6 +287,27 @@ mod tests {
             discover_files_with_diagnostics(fixture.path()).expect("discovery should work");
 
         assert_eq!(result.files, [real_file]);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == crate::scanner::result::DiagnosticKind::Discovery
+                && diagnostic.path.as_deref() == Some(symlink_path.as_path())
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_with_application_bundle_suffix_is_not_discovered() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestDirectory::new();
+        let real_bundle = fixture.create_dir("RealBundle");
+        fixture.create_file("RealBundle/Contents/MacOS/main");
+        let symlink_path = fixture.path().join("Linked.app");
+        symlink(&real_bundle, &symlink_path).expect("test symlink should be created");
+
+        let result =
+            discover_files_with_diagnostics(fixture.path()).expect("discovery should work");
+
+        assert!(result.app_bundles.is_empty());
         assert!(result.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == crate::scanner::result::DiagnosticKind::Discovery
                 && diagnostic.path.as_deref() == Some(symlink_path.as_path())

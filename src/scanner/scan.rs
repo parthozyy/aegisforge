@@ -3,6 +3,10 @@ use std::path::Path;
 use crate::detection::analyzer::{MachODependencyContext, analyze_artifact_result};
 use crate::detection::verdict::determine_verdict;
 use crate::detection::yara::YaraEngine;
+use crate::macos::codesign::{
+    CodeSignatureInspection, CodeSignatureInspector, CodeSignatureTargetKind,
+    platform_code_signature_inspector,
+};
 
 use super::discovery::{DiscoveryResult, discover_files_with_diagnostics};
 use super::file_type::ArtifactType;
@@ -19,17 +23,23 @@ pub fn scan_path(path: &Path) -> Result<ScanResult, String> {
     let target_type = inspect_path(path)?;
     let yara_engine = YaraEngine::from_directory(Path::new("rules/yara"))?;
     let discovery = discover_files_with_diagnostics(path)?;
+    let inspector = platform_code_signature_inspector();
 
     Ok(assemble_scan_result(
         path,
         target_type,
         discovery,
         &yara_engine,
+        &inspector,
     ))
 }
 
 #[cfg(test)]
-fn scan_path_with_yara(path: &Path, yara_engine: &YaraEngine) -> Result<ScanResult, String> {
+fn scan_path_with_yara(
+    path: &Path,
+    yara_engine: &YaraEngine,
+    inspector: &dyn CodeSignatureInspector,
+) -> Result<ScanResult, String> {
     let target_type = inspect_path(path)?;
     let discovery = discover_files_with_diagnostics(path)?;
 
@@ -38,21 +48,65 @@ fn scan_path_with_yara(path: &Path, yara_engine: &YaraEngine) -> Result<ScanResu
         target_type,
         discovery,
         yara_engine,
+        inspector,
     ))
+}
+
+struct StaticScanOutput {
+    artifacts: Vec<ArtifactResult>,
+    diagnostics: Vec<ScanDiagnostic>,
+    failed: usize,
+    macho_signature_targets: Vec<std::path::PathBuf>,
+    bundle_signature_targets: Vec<std::path::PathBuf>,
 }
 
 fn assemble_scan_result(
     target: &Path,
     target_type: PathType,
-    mut discovery: DiscoveryResult,
+    discovery: DiscoveryResult,
     yara_engine: &YaraEngine,
+    inspector: &dyn CodeSignatureInspector,
 ) -> ScanResult {
-    let mut diagnostics = discovery.diagnostics;
+    let static_output = assemble_static_scan(discovery, yara_engine);
+    let code_signatures = inspect_signature_targets(&static_output, inspector);
+    let StaticScanOutput {
+        artifacts,
+        mut diagnostics,
+        failed,
+        macho_signature_targets: _,
+        bundle_signature_targets: _,
+    } = static_output;
+
+    let summary = ScanSummary::from_artifacts(failed, &artifacts);
+    diagnostics.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| diagnostic_kind_rank(left.kind).cmp(&diagnostic_kind_rank(right.kind)))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+
+    ScanResult {
+        target: target.to_path_buf(),
+        target_type,
+        artifacts,
+        code_signatures,
+        diagnostics,
+        summary,
+    }
+}
+
+fn assemble_static_scan(discovery: DiscoveryResult, yara_engine: &YaraEngine) -> StaticScanOutput {
+    let DiscoveryResult {
+        mut files,
+        app_bundles,
+        mut diagnostics,
+    } = discovery;
     let mut artifacts = Vec::new();
     let mut failed = 0;
-    discovery.files.sort();
+    let mut macho_signature_targets = Vec::new();
+    files.sort();
 
-    for file in discovery.files {
+    for file in files {
         let collected = match collect_artifact(&file) {
             Ok(collected) => collected,
             Err(error) => {
@@ -73,6 +127,8 @@ fn assemble_scan_result(
         let mut macho_dependencies = None;
 
         if artifact.file_type == ArtifactType::MachO {
+            macho_signature_targets.push(artifact.path.clone());
+
             match inspect_macho(&collected.contents) {
                 Ok(info) => {
                     macho = Some(info);
@@ -154,21 +210,73 @@ fn assemble_scan_result(
         });
     }
 
-    let summary = ScanSummary::from_artifacts(failed, &artifacts);
-    diagnostics.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| diagnostic_kind_rank(left.kind).cmp(&diagnostic_kind_rank(right.kind)))
-            .then_with(|| left.message.cmp(&right.message))
-    });
+    macho_signature_targets.sort();
+    macho_signature_targets.dedup();
+    let mut bundle_signature_targets = app_bundles;
+    bundle_signature_targets.sort();
+    bundle_signature_targets.dedup();
 
-    ScanResult {
-        target: target.to_path_buf(),
-        target_type,
+    StaticScanOutput {
         artifacts,
         diagnostics,
-        summary,
+        failed,
+        macho_signature_targets,
+        bundle_signature_targets,
     }
+}
+
+fn inspect_signature_targets(
+    static_output: &StaticScanOutput,
+    inspector: &dyn CodeSignatureInspector,
+) -> Vec<CodeSignatureInspection> {
+    let mut inspections = Vec::with_capacity(
+        static_output.macho_signature_targets.len() + static_output.bundle_signature_targets.len(),
+    );
+
+    for target in &static_output.macho_signature_targets {
+        inspections.push(inspect_signature_target(
+            inspector,
+            target,
+            CodeSignatureTargetKind::MachOFile,
+        ));
+    }
+
+    for target in &static_output.bundle_signature_targets {
+        inspections.push(inspect_signature_target(
+            inspector,
+            target,
+            CodeSignatureTargetKind::ApplicationBundle,
+        ));
+    }
+
+    inspections.sort_by(|left, right| {
+        left.target
+            .cmp(&right.target)
+            .then_with(|| left.target_kind.cmp(&right.target_kind))
+    });
+    inspections
+}
+
+fn inspect_signature_target(
+    inspector: &dyn CodeSignatureInspector,
+    target: &Path,
+    target_kind: CodeSignatureTargetKind,
+) -> CodeSignatureInspection {
+    let inspection = inspector.inspect(target, target_kind);
+    if inspection.target == target && inspection.target_kind == target_kind {
+        return inspection;
+    }
+
+    let mut replacement = CodeSignatureInspection::unknown(target.to_path_buf(), target_kind);
+    replacement.diagnostics.push(ScanDiagnostic::new(
+        DiagnosticKind::CodeSignature,
+        Some(target.to_path_buf()),
+        format!(
+            "code-signature inspector returned a mismatched target identity for {} request",
+            target_kind.as_str()
+        ),
+    ));
+    replacement
 }
 
 fn diagnostic_kind_rank(kind: DiagnosticKind) -> u8 {
@@ -177,12 +285,15 @@ fn diagnostic_kind_rank(kind: DiagnosticKind) -> u8 {
         DiagnosticKind::Metadata => 1,
         DiagnosticKind::MachOHeader => 2,
         DiagnosticKind::MachODependencies => 3,
-        DiagnosticKind::Yara => 4,
+        DiagnosticKind::CodeSignature => 4,
+        DiagnosticKind::Yara => 5,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
     #[cfg(unix)]
     use std::ffi::CString;
     use std::fs;
@@ -202,6 +313,10 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use crate::detection::verdict::Verdict;
+    use crate::macos::codesign::{
+        CodeSignatureInspection, CodeSignatureInspector, CodeSignatureTargetKind,
+        NativeCheckStatus, SignatureKind, SignaturePresence,
+    };
     use crate::scanner::discovery::DiscoveryResult;
     use crate::scanner::result::{Detector, DetectorOutcome, DetectorStatus, DiagnosticKind};
 
@@ -276,13 +391,445 @@ mod tests {
         YaraEngine::from_source(NO_MATCH_RULE).expect("harmless YARA rule should compile")
     }
 
+    struct FakeCodeSignatureInspector {
+        calls: RefCell<Vec<(PathBuf, CodeSignatureTargetKind)>>,
+        inspections: RefCell<VecDeque<CodeSignatureInspection>>,
+    }
+
+    impl FakeCodeSignatureInspector {
+        fn new(inspections: impl IntoIterator<Item = CodeSignatureInspection>) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                inspections: RefCell::new(inspections.into_iter().collect()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(PathBuf, CodeSignatureTargetKind)> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl CodeSignatureInspector for FakeCodeSignatureInspector {
+        fn inspect(
+            &self,
+            target: &Path,
+            target_kind: CodeSignatureTargetKind,
+        ) -> CodeSignatureInspection {
+            self.calls
+                .borrow_mut()
+                .push((target.to_path_buf(), target_kind));
+            self.inspections
+                .borrow_mut()
+                .pop_front()
+                .expect("fake inspector should have a queued inspection")
+        }
+    }
+
+    fn unknown_inspection(
+        target: impl Into<PathBuf>,
+        target_kind: CodeSignatureTargetKind,
+    ) -> CodeSignatureInspection {
+        CodeSignatureInspection::unknown(target.into(), target_kind)
+    }
+
+    #[test]
+    fn content_classified_macho_is_inspected_once() {
+        let fixture = TempDir::new();
+        let macho = fixture.write_file("tool", &[0xCF, 0xFA, 0xED, 0xFE]);
+        let engine = no_match_engine();
+        let inspector = FakeCodeSignatureInspector::new([unknown_inspection(
+            macho.clone(),
+            CodeSignatureTargetKind::MachOFile,
+        )]);
+
+        let result = scan_path_with_yara(&macho, &engine, &inspector)
+            .expect("Mach-O scan should complete despite parser errors");
+
+        assert_eq!(
+            inspector.calls(),
+            [(macho.clone(), CodeSignatureTargetKind::MachOFile)]
+        );
+        assert_eq!(result.code_signatures.len(), 1);
+        assert_eq!(result.code_signatures[0].target, macho);
+    }
+
+    #[test]
+    fn non_macho_is_never_inspected_for_code_signing() {
+        let fixture = TempDir::new();
+        let ordinary = fixture.write_file("ordinary.txt", b"ordinary content");
+        let engine = no_match_engine();
+        let inspector = FakeCodeSignatureInspector::new([]);
+
+        let result = scan_path_with_yara(&ordinary, &engine, &inspector)
+            .expect("ordinary file scan should complete");
+
+        assert!(inspector.calls().is_empty());
+        assert!(result.code_signatures.is_empty());
+    }
+
+    #[test]
+    fn every_bundle_is_inspected_once_while_bundle_contents_are_analyzed() {
+        let fixture = TempDir::new();
+        let first_bundle = fixture.path().join("First.app");
+        let second_bundle = fixture.path().join("nested/Second.APP");
+        fs::create_dir_all(&first_bundle).expect("first bundle should be creatable");
+        fs::create_dir_all(&second_bundle).expect("second bundle should be creatable");
+        let first_file = fixture.write_file("First.app/Contents/resource.txt", b"first");
+        let second_file = fixture.write_file("nested/Second.APP/Contents/resource.txt", b"second");
+        let engine = no_match_engine();
+        let inspector = FakeCodeSignatureInspector::new([
+            unknown_inspection(
+                first_bundle.clone(),
+                CodeSignatureTargetKind::ApplicationBundle,
+            ),
+            unknown_inspection(
+                second_bundle.clone(),
+                CodeSignatureTargetKind::ApplicationBundle,
+            ),
+        ]);
+
+        let result = scan_path_with_yara(fixture.path(), &engine, &inspector)
+            .expect("bundle tree scan should complete");
+
+        assert_eq!(
+            inspector.calls(),
+            [
+                (
+                    first_bundle.clone(),
+                    CodeSignatureTargetKind::ApplicationBundle,
+                ),
+                (
+                    second_bundle.clone(),
+                    CodeSignatureTargetKind::ApplicationBundle,
+                ),
+            ]
+        );
+        assert_eq!(
+            result
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.artifact.path.clone())
+                .collect::<Vec<_>>(),
+            [first_file, second_file]
+        );
+    }
+
+    #[test]
+    fn signature_invocations_are_grouped_and_sorted_but_results_are_globally_sorted() {
+        let fixture = TempDir::new();
+        let a_macho = fixture.write_file("a-tool", &[0xCF, 0xFA, 0xED, 0xFE]);
+        let z_macho = fixture.write_file("z-tool", &[0xCF, 0xFA, 0xED, 0xFE]);
+        let b_bundle = fixture.path().join("b.app");
+        let y_bundle = fixture.path().join("y.app");
+        fs::create_dir_all(&b_bundle).expect("bundle should be creatable");
+        fs::create_dir_all(&y_bundle).expect("bundle should be creatable");
+        let discovery = DiscoveryResult {
+            files: vec![z_macho.clone(), a_macho.clone(), z_macho.clone()],
+            app_bundles: vec![y_bundle.clone(), b_bundle.clone(), y_bundle.clone()],
+            diagnostics: Vec::new(),
+        };
+        let engine = no_match_engine();
+        let inspector = FakeCodeSignatureInspector::new([
+            unknown_inspection(a_macho.clone(), CodeSignatureTargetKind::MachOFile),
+            unknown_inspection(z_macho.clone(), CodeSignatureTargetKind::MachOFile),
+            unknown_inspection(b_bundle.clone(), CodeSignatureTargetKind::ApplicationBundle),
+            unknown_inspection(y_bundle.clone(), CodeSignatureTargetKind::ApplicationBundle),
+        ]);
+
+        let result = assemble_scan_result(
+            fixture.path(),
+            PathType::Directory,
+            discovery,
+            &engine,
+            &inspector,
+        );
+
+        assert_eq!(
+            inspector.calls(),
+            [
+                (a_macho.clone(), CodeSignatureTargetKind::MachOFile),
+                (z_macho.clone(), CodeSignatureTargetKind::MachOFile),
+                (b_bundle.clone(), CodeSignatureTargetKind::ApplicationBundle,),
+                (y_bundle.clone(), CodeSignatureTargetKind::ApplicationBundle,),
+            ]
+        );
+        assert_eq!(
+            result
+                .code_signatures
+                .iter()
+                .map(|inspection| (inspection.target.clone(), inspection.target_kind))
+                .collect::<Vec<_>>(),
+            [
+                (a_macho, CodeSignatureTargetKind::MachOFile),
+                (b_bundle, CodeSignatureTargetKind::ApplicationBundle),
+                (y_bundle, CodeSignatureTargetKind::ApplicationBundle),
+                (z_macho, CodeSignatureTargetKind::MachOFile),
+            ]
+        );
+    }
+
+    #[test]
+    fn signature_results_use_target_kind_as_the_path_tiebreaker() {
+        let shared_target = PathBuf::from("same-target");
+        let static_output = StaticScanOutput {
+            artifacts: Vec::new(),
+            diagnostics: Vec::new(),
+            failed: 0,
+            macho_signature_targets: vec![shared_target.clone()],
+            bundle_signature_targets: vec![shared_target.clone()],
+        };
+        let inspector = FakeCodeSignatureInspector::new([
+            unknown_inspection(shared_target.clone(), CodeSignatureTargetKind::MachOFile),
+            unknown_inspection(
+                shared_target.clone(),
+                CodeSignatureTargetKind::ApplicationBundle,
+            ),
+        ]);
+
+        let inspections = inspect_signature_targets(&static_output, &inspector);
+
+        assert_eq!(
+            inspections
+                .iter()
+                .map(|inspection| (inspection.target.clone(), inspection.target_kind))
+                .collect::<Vec<_>>(),
+            [
+                (shared_target.clone(), CodeSignatureTargetKind::MachOFile),
+                (shared_target, CodeSignatureTargetKind::ApplicationBundle),
+            ]
+        );
+    }
+
+    #[test]
+    fn mismatched_inspector_identity_is_replaced_without_copying_untrusted_facts() {
+        let requested_macho = PathBuf::from("a-requested-macho");
+        let requested_bundle = PathBuf::from("b-requested.app");
+        let later_bundle = PathBuf::from("z-later.app");
+        let static_output = StaticScanOutput {
+            artifacts: Vec::new(),
+            diagnostics: Vec::new(),
+            failed: 0,
+            macho_signature_targets: vec![requested_macho.clone()],
+            bundle_signature_targets: vec![requested_bundle.clone(), later_bundle.clone()],
+        };
+        let untrusted_diagnostic = ScanDiagnostic::new(
+            DiagnosticKind::CodeSignature,
+            Some(PathBuf::from("untrusted-path")),
+            "untrusted diagnostic".to_string(),
+        );
+        let mut mismatched_path = unknown_inspection(
+            PathBuf::from("different-target"),
+            CodeSignatureTargetKind::MachOFile,
+        );
+        mismatched_path.presence = SignaturePresence::Signed;
+        mismatched_path.verification_status = NativeCheckStatus::Passed;
+        mismatched_path.metadata_status = NativeCheckStatus::Passed;
+        mismatched_path.identifier = Some("untrusted.identifier".to_string());
+        mismatched_path.team_identifier = Some("UNTRUSTEDTEAM".to_string());
+        mismatched_path.authorities = vec!["Untrusted Authority".to_string()];
+        mismatched_path.signature_kind = SignatureKind::CertificateBacked;
+        mismatched_path.hardened_runtime = Some(true);
+        mismatched_path.verification_detail = Some("untrusted detail".to_string());
+        mismatched_path
+            .diagnostics
+            .push(untrusted_diagnostic.clone());
+        let mut mismatched_kind =
+            unknown_inspection(requested_bundle.clone(), CodeSignatureTargetKind::MachOFile);
+        mismatched_kind.identifier = Some("also.untrusted".to_string());
+        mismatched_kind.diagnostics.push(untrusted_diagnostic);
+        let valid_later = unknown_inspection(
+            later_bundle.clone(),
+            CodeSignatureTargetKind::ApplicationBundle,
+        );
+        let inspector = FakeCodeSignatureInspector::new([
+            mismatched_path,
+            mismatched_kind,
+            valid_later.clone(),
+        ]);
+
+        let inspections = inspect_signature_targets(&static_output, &inspector);
+
+        assert_eq!(inspector.calls().len(), 3, "later targets must still run");
+        assert_eq!(inspections.len(), 3);
+        for (inspection, requested_target, requested_kind) in [
+            (
+                &inspections[0],
+                &requested_macho,
+                CodeSignatureTargetKind::MachOFile,
+            ),
+            (
+                &inspections[1],
+                &requested_bundle,
+                CodeSignatureTargetKind::ApplicationBundle,
+            ),
+        ] {
+            let mut expected =
+                CodeSignatureInspection::unknown(requested_target.clone(), requested_kind);
+            expected.diagnostics.push(ScanDiagnostic::new(
+                DiagnosticKind::CodeSignature,
+                Some(requested_target.clone()),
+                format!(
+                    "code-signature inspector returned a mismatched target identity for {} request",
+                    requested_kind.as_str()
+                ),
+            ));
+            assert_eq!(inspection, &expected);
+        }
+        assert_eq!(inspections[2], valid_later);
+    }
+
+    #[test]
+    fn failed_signature_is_retained_and_later_targets_continue() {
+        let fixture = TempDir::new();
+        let first = fixture.write_file("a-tool", &[0xCF, 0xFA, 0xED, 0xFE]);
+        let later = fixture.write_file("z-tool", &[0xCF, 0xFA, 0xED, 0xFE]);
+        let failure_diagnostic = ScanDiagnostic::new(
+            DiagnosticKind::CodeSignature,
+            Some(first.clone()),
+            "native inspection unavailable".to_string(),
+        );
+        let mut failed = unknown_inspection(first.clone(), CodeSignatureTargetKind::MachOFile);
+        failed.verification_status = NativeCheckStatus::Unavailable;
+        failed.metadata_status = NativeCheckStatus::Failed;
+        failed.diagnostics.push(failure_diagnostic.clone());
+        let inspector = FakeCodeSignatureInspector::new([
+            failed,
+            unknown_inspection(later.clone(), CodeSignatureTargetKind::MachOFile),
+        ]);
+        let discovery = DiscoveryResult {
+            files: vec![later.clone(), first.clone()],
+            app_bundles: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let result = assemble_scan_result(
+            fixture.path(),
+            PathType::Directory,
+            discovery,
+            &no_match_engine(),
+            &inspector,
+        );
+
+        assert_eq!(inspector.calls().len(), 2);
+        assert_eq!(result.code_signatures.len(), 2);
+        assert_eq!(result.code_signatures[0].target, first);
+        assert_eq!(
+            result.code_signatures[0].verification_status,
+            NativeCheckStatus::Unavailable
+        );
+        assert_eq!(
+            result.code_signatures[0].metadata_status,
+            NativeCheckStatus::Failed
+        );
+        assert_eq!(result.code_signatures[0].diagnostics, [failure_diagnostic]);
+        assert_eq!(result.code_signatures[1].target, later);
+    }
+
+    #[test]
+    fn signature_results_do_not_change_artifact_analysis_or_summary() {
+        let fixture = TempDir::new();
+        let macho = fixture.write_file("tool", &[0xCF, 0xFA, 0xED, 0xFE]);
+        let bundle = fixture.path().join("Tool.app");
+        fs::create_dir(&bundle).expect("bundle should be creatable");
+        let discovery = DiscoveryResult {
+            files: vec![macho.clone()],
+            app_bundles: vec![bundle.clone()],
+            diagnostics: Vec::new(),
+        };
+        let inspector = FakeCodeSignatureInspector::new([
+            unknown_inspection(macho, CodeSignatureTargetKind::MachOFile),
+            unknown_inspection(bundle, CodeSignatureTargetKind::ApplicationBundle),
+        ]);
+
+        let result = assemble_scan_result(
+            fixture.path(),
+            PathType::Directory,
+            discovery,
+            &no_match_engine(),
+            &inspector,
+        );
+
+        assert_eq!(result.summary.discovered, 1);
+        assert_eq!(result.summary.analyzed, 1);
+        assert_eq!(result.summary.failed, 0);
+        assert_eq!(result.summary.unknown, 1);
+        assert_eq!(result.summary.suspicious, 0);
+        assert_eq!(result.summary.malicious, 0);
+        assert_eq!(result.artifacts[0].verdict, Verdict::Unknown);
+        assert!(result.artifacts[0].evidence.is_empty());
+        assert_eq!(result.code_signatures.len(), 2);
+    }
+
+    #[test]
+    fn static_phase_completes_artifacts_and_targets_without_native_access() {
+        let fixture = TempDir::new();
+        let macho = fixture.write_file("tool", &[0xCF, 0xFA, 0xED, 0xFE]);
+        let ordinary = fixture.write_file("ordinary", b"ordinary");
+        let bundle = fixture.path().join("Tool.app");
+        fs::create_dir(&bundle).expect("bundle should be creatable");
+        let discovery = DiscoveryResult {
+            files: vec![ordinary.clone(), macho.clone()],
+            app_bundles: vec![bundle.clone()],
+            diagnostics: Vec::new(),
+        };
+        let inspector = FakeCodeSignatureInspector::new([]);
+
+        let static_output = assemble_static_scan(discovery, &no_match_engine());
+
+        assert!(inspector.calls().is_empty());
+        assert_eq!(static_output.artifacts.len(), 2);
+        assert_eq!(static_output.macho_signature_targets, [macho]);
+        assert_eq!(static_output.bundle_signature_targets, [bundle]);
+        assert_eq!(static_output.failed, 0);
+        assert_eq!(
+            static_output
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.artifact.path.clone())
+                .collect::<Vec<_>>(),
+            [ordinary, fixture.path().join("tool")]
+        );
+    }
+
+    #[test]
+    fn native_phase_accepts_completed_static_output_and_inspects_all_pending_targets() {
+        let fixture = TempDir::new();
+        let macho = fixture.write_file("tool", &[0xCF, 0xFA, 0xED, 0xFE]);
+        let bundle = fixture.path().join("Tool.app");
+        fs::create_dir(&bundle).expect("bundle should be creatable");
+        let static_output = assemble_static_scan(
+            DiscoveryResult {
+                files: vec![macho.clone()],
+                app_bundles: vec![bundle.clone()],
+                diagnostics: Vec::new(),
+            },
+            &no_match_engine(),
+        );
+        let inspector = FakeCodeSignatureInspector::new([
+            unknown_inspection(macho.clone(), CodeSignatureTargetKind::MachOFile),
+            unknown_inspection(bundle.clone(), CodeSignatureTargetKind::ApplicationBundle),
+        ]);
+
+        let inspections = inspect_signature_targets(&static_output, &inspector);
+
+        assert_eq!(inspections.len(), 2);
+        assert_eq!(
+            inspector.calls(),
+            [
+                (macho, CodeSignatureTargetKind::MachOFile),
+                (bundle, CodeSignatureTargetKind::ApplicationBundle),
+            ]
+        );
+    }
+
     #[test]
     fn non_macho_scan_marks_macho_detectors_not_applicable() {
         let fixture = TempDir::new();
         let path = fixture.write_file("ordinary.txt", b"ordinary readable content");
         let engine = no_match_engine();
+        let inspector = FakeCodeSignatureInspector::new([]);
 
-        let result = scan_path_with_yara(&path, &engine).expect("scan should succeed");
+        let result = scan_path_with_yara(&path, &engine, &inspector).expect("scan should succeed");
 
         assert_eq!(result.target, path);
         assert_eq!(result.target_type, PathType::File);
@@ -309,9 +856,10 @@ mod tests {
         fixture.write_file("nested/b.txt", b"b");
         fixture.write_file("a.txt", b"a");
         let engine = no_match_engine();
+        let inspector = FakeCodeSignatureInspector::new([]);
 
-        let result =
-            scan_path_with_yara(fixture.path(), &engine).expect("directory scan should succeed");
+        let result = scan_path_with_yara(fixture.path(), &engine, &inspector)
+            .expect("directory scan should succeed");
         let relative_paths: Vec<_> = result
             .artifacts
             .iter()
@@ -338,11 +886,19 @@ mod tests {
         let readable = fixture.write_file("readable.txt", b"readable");
         let discovery = DiscoveryResult {
             files: vec![missing.clone(), readable.clone()],
+            app_bundles: Vec::new(),
             diagnostics: Vec::new(),
         };
         let engine = no_match_engine();
+        let inspector = FakeCodeSignatureInspector::new([]);
 
-        let result = assemble_scan_result(fixture.path(), PathType::Directory, discovery, &engine);
+        let result = assemble_scan_result(
+            fixture.path(),
+            PathType::Directory,
+            discovery,
+            &engine,
+            &inspector,
+        );
 
         assert_eq!(result.summary.discovered, 2);
         assert_eq!(result.summary.analyzed, 1);
@@ -374,12 +930,20 @@ mod tests {
         symlink(&outside_path, &discovered_path).expect("replacement symlink should be creatable");
         let discovery = DiscoveryResult {
             files: vec![discovered_path.clone()],
+            app_bundles: Vec::new(),
             diagnostics: Vec::new(),
         };
         let engine = YaraEngine::from_source(REPLACEMENT_MATCH_RULE)
             .expect("replacement-detecting YARA rule should compile");
+        let inspector = FakeCodeSignatureInspector::new([]);
 
-        let result = assemble_scan_result(fixture.path(), PathType::Directory, discovery, &engine);
+        let result = assemble_scan_result(
+            fixture.path(),
+            PathType::Directory,
+            discovery,
+            &engine,
+            &inspector,
+        );
 
         assert_eq!(result.summary.discovered, 1);
         assert_eq!(result.summary.analyzed, 0);
@@ -409,10 +973,13 @@ mod tests {
         let worker = thread::spawn(move || {
             let discovery = DiscoveryResult {
                 files: vec![worker_fifo_path],
+                app_bundles: Vec::new(),
                 diagnostics: Vec::new(),
             };
             let engine = no_match_engine();
-            let result = assemble_scan_result(&target, PathType::Directory, discovery, &engine);
+            let inspector = FakeCodeSignatureInspector::new([]);
+            let result =
+                assemble_scan_result(&target, PathType::Directory, discovery, &engine, &inspector);
             let _ = sender.send(result);
         });
 
@@ -453,11 +1020,19 @@ mod tests {
         fs::create_dir(&directory_path).expect("fixture directory should be creatable");
         let discovery = DiscoveryResult {
             files: vec![directory_path.clone()],
+            app_bundles: Vec::new(),
             diagnostics: Vec::new(),
         };
         let engine = no_match_engine();
+        let inspector = FakeCodeSignatureInspector::new([]);
 
-        let result = assemble_scan_result(fixture.path(), PathType::Directory, discovery, &engine);
+        let result = assemble_scan_result(
+            fixture.path(),
+            PathType::Directory,
+            discovery,
+            &engine,
+            &inspector,
+        );
 
         assert_eq!(result.summary.discovered, 1);
         assert_eq!(result.summary.analyzed, 0);
@@ -476,6 +1051,7 @@ mod tests {
         let z_path = fixture.path().join("z.txt");
         let discovery = DiscoveryResult {
             files: Vec::new(),
+            app_bundles: Vec::new(),
             diagnostics: vec![
                 ScanDiagnostic::new(
                     DiagnosticKind::Discovery,
@@ -486,6 +1062,11 @@ mod tests {
                     DiagnosticKind::Yara,
                     Some(a_path.clone()),
                     "yara diagnostic".to_string(),
+                ),
+                ScanDiagnostic::new(
+                    DiagnosticKind::CodeSignature,
+                    Some(a_path.clone()),
+                    "signature diagnostic".to_string(),
                 ),
                 ScanDiagnostic::new(
                     DiagnosticKind::Discovery,
@@ -500,8 +1081,15 @@ mod tests {
             ],
         };
         let engine = no_match_engine();
+        let inspector = FakeCodeSignatureInspector::new([]);
 
-        let result = assemble_scan_result(fixture.path(), PathType::Directory, discovery, &engine);
+        let result = assemble_scan_result(
+            fixture.path(),
+            PathType::Directory,
+            discovery,
+            &engine,
+            &inspector,
+        );
 
         assert_eq!(
             result.diagnostics,
@@ -515,6 +1103,11 @@ mod tests {
                     DiagnosticKind::Discovery,
                     Some(a_path.clone()),
                     "beta".to_string(),
+                ),
+                ScanDiagnostic::new(
+                    DiagnosticKind::CodeSignature,
+                    Some(a_path.clone()),
+                    "signature diagnostic".to_string(),
                 ),
                 ScanDiagnostic::new(
                     DiagnosticKind::Yara,
@@ -535,8 +1128,12 @@ mod tests {
         let fixture = TempDir::new();
         let path = fixture.write_file("malformed", &[0xCF, 0xFA, 0xED, 0xFE]);
         let engine = no_match_engine();
+        let inspector = FakeCodeSignatureInspector::new([unknown_inspection(
+            path.clone(),
+            CodeSignatureTargetKind::MachOFile,
+        )]);
 
-        let result = scan_path_with_yara(&path, &engine).expect("scan should complete");
+        let result = scan_path_with_yara(&path, &engine, &inspector).expect("scan should complete");
         let artifact = &result.artifacts[0];
 
         assert_eq!(artifact.verdict, Verdict::Unknown);
