@@ -1247,6 +1247,57 @@ mod tests {
     }
 
     #[test]
+    fn metadata_output_limit_preserves_successful_verification_without_inventing_metadata() {
+        let directory = TestDirectory::new();
+        let target = directory.file("output-limited");
+        let limit_reason = "native command stderr exceeded 1048576-byte limit";
+        let runner = RecordingRunner::new([
+            command_output(true, "", "valid\n"),
+            Err(NativeCommandError::Io(limit_reason.to_string())),
+        ]);
+        let inspector = CodesignInspector::new(runner);
+
+        let inspection = inspector.inspect(&target, CodeSignatureTargetKind::MachOFile);
+
+        assert_eq!(inspection.presence, SignaturePresence::Signed);
+        assert_eq!(inspection.verification_status, NativeCheckStatus::Passed);
+        assert_eq!(inspection.metadata_status, NativeCheckStatus::Error);
+        assert_eq!(inspection.identifier, None);
+        assert_eq!(inspection.team_identifier, None);
+        assert!(inspection.authorities.is_empty());
+        assert_eq!(inspection.signature_kind, SignatureKind::Unknown);
+        assert_eq!(inspection.hardened_runtime, None);
+        assert_eq!(inspection.verification_detail, None);
+        assert_eq!(inspection.diagnostics.len(), 1);
+        assert_eq!(
+            inspection.diagnostics[0].kind,
+            DiagnosticKind::CodeSignature
+        );
+        assert!(inspection.diagnostics[0].message.contains(limit_reason));
+        assert_eq!(
+            inspector.runner.calls.borrow().as_slice(),
+            [
+                RecordedCall {
+                    program: PathBuf::from("/usr/bin/codesign"),
+                    arguments: vec![
+                        OsString::from("--verify"),
+                        OsString::from("--verbose=4"),
+                        target.clone().into_os_string(),
+                    ],
+                },
+                RecordedCall {
+                    program: PathBuf::from("/usr/bin/codesign"),
+                    arguments: vec![
+                        OsString::from("-d"),
+                        OsString::from("--verbose=4"),
+                        target.into_os_string(),
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn invokes_codesign_with_exact_arguments_and_keeps_hostile_bundle_path_atomic() {
         let directory = TestDirectory::new();
         let target = directory.bundle("name with spaces;$(touch nope).app");

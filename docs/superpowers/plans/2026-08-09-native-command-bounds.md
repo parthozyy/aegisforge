@@ -4,11 +4,11 @@
 
 **Goal:** Bound every native codesign invocation by time and per-stream memory while preserving exact arguments, raw successful output, existing error mapping, and nonfatal scan behavior.
 
-**Architecture:** Replace `Command::output()` inside `SystemCommandRunner` with a private, dependency-free supervisor. Two bounded reader threads report structured stdout/stderr outcomes, while the parent polls child state and one monotonic deadline. Unix children run in a new process group; abnormal completion uses fixed TERM/KILL and reader-close grace periods, discards partial output, reaps the direct child, and returns the existing `NativeCommandError::Io` type.
+**Architecture:** Replace `Command::output()` inside `SystemCommandRunner` with a private, dependency-free supervisor. Two bounded reader threads report structured stdout/stderr outcomes, while the parent tracks their handles and one monotonic deadline; it polls child state only after both streams reach EOF. Unix children run in a new process group. Abnormal completion uses fixed TERM/KILL, bounded best-effort direct-child reap polling, and reader-close grace periods, discards partial output, reports cleanup failures without hiding the primary error, and returns the existing `NativeCommandError::Io` type.
 
 **Tech Stack:** Rust 2024 standard library (`std::process`, `std::thread`, `std::sync::mpsc`, `std::time`), existing Unix `libc` dependency, Cargo locked/offline test gates.
 
-**Commit policy:** The design spec is already committed. Do not commit after individual tasks. After all tasks and reviews pass, create one coherent implementation commit and push the module branch `feature/native-command-hardening`. The completed `feature/cli-skeleton` branch remains unchanged.
+**Commit policy:** Do not commit after individual tasks. After all tasks and reviews pass, create one coherent implementation commit containing the dependency-scope comment, command supervisor, codesign integration regression, corrected design spec, and plan, then push the module branch `feature/native-command-hardening`. The completed `feature/cli-skeleton` branch remains unchanged.
 
 ---
 
@@ -125,14 +125,16 @@ Add `#[cfg(unix)]` controlled helper tests. Create a uniquely owned temporary di
 Cover:
 
 1. a helper that atomically records its PID, installs a `SIGTERM` handler, records TERM receipt to a marker file from its normal loop, and deliberately remains alive: a short test deadline/grace must return timeout `Io`; assert the TERM marker exists and polling `kill(pid, 0)` reaches `ESRCH`, proving TERM preceded forced KILL;
-2. a helper that spawns a second marked-test-executable helper with inherited stdout/stderr and then exits. The descendant helper atomically records its PID, installs the same TERM-recording handler, and deliberately remains alive after TERM. Direct-child exit alone must not be success; the open pipe must reach the shared deadline, group cleanup must run, and `Io` must return promptly. Assert the descendant TERM marker exists and polling `kill(pid, 0)` reaches `ESRCH`. This proves TERM and forced KILL both target the process group after its leader has exited, rather than merely killing/detaching the direct child;
+2. a helper that spawns a second marked-test-executable helper with inherited stdout/stderr and then exits. The descendant helper atomically records its PID, installs the same TERM-recording handler, and deliberately remains alive after TERM. Direct-child exit alone must not be success; the open pipe must reach the shared deadline while the exited leader remains unreaped, group cleanup must run, and `Io` must return promptly. Assert the descendant TERM marker exists and polling `kill(pid, 0)` reaches `ESRCH`. This proves TERM and forced KILL both target the process group while its leader identity remains pinned;
 3. a helper that writes more than a small cap to stdout and exits: result must be stdout-limit `Io`, never successful output;
 4. the same for stderr;
 5. a helper that exits nonzero with bounded separate output: return `NativeCommandOutput` with raw streams and exit code;
 6. a direct `/bin/sleep` timeout returns promptly;
-7. a test-only supervision seam receiving a synthetic reader error or disconnected outcome channel initiates cleanup and returns `Io`;
-8. a test-only post-spawn setup-failure seam terminates and reaps a running child;
-9. a cleanup/state seam with an already recorded `ExitStatus` proves neither `wait()` nor direct-child kill is invoked a second time, while process-group cleanup may still target descendants.
+7. test-only supervision seams receiving a synthetic reader error, disconnected outcome channel, or one finished/panicked reader while its sibling sender remains live initiate cleanup promptly and return the reader failure as primary `Io`;
+8. a test-only post-spawn setup-failure seam attempts bounded termination/reaping of a running child and confirms that the controlled helper reaches `ESRCH`;
+9. cleanup/state seams prove an already recorded `ExitStatus` skips all numeric signaling and reaping, while an unreaped leader remains pinned through group TERM/KILL before direct-child kill and bounded nonblocking reap polling;
+10. `run_with_limits` rejects any `output_limit` above the 1 MiB production maximum before spawn or reader allocation, returning `NativeCommandError::Io` instead of risking a reader-thread allocation panic. Zero and small test caps remain valid.
+11. through the full `run_with_limits` path, an exited leader remains unreaped while its bounded, self-exiting pipe-holding descendant creates a new session. This proves signals to the recorded child PGID may be ineffective, direct-child kill/reap polling and reader cleanup still return promptly, and both helper PIDs reach confirmed `ESRCH`. Pathological `Duration::MAX` limits return structured `Io` before spawn.
 
 Never invoke `sh`, `bash`, or a command string. Use only the absolute current test executable and fixed absolute system executables with atomic `OsString` arguments.
 
@@ -155,6 +157,8 @@ pub struct SystemCommandRunner;
 ```
 
 `NativeCommandRunner::run` must delegate to a private `run_with_limits(program, arguments, production_limits())`.
+
+Before constructing or spawning a command, validate `limits.output_limit <= MAX_NATIVE_OUTPUT_BYTES`, where `MAX_NATIVE_OUTPUT_BYTES` is the same 1 MiB compile-time policy used by production. The bounded reader is private and may only be started through this validated supervision path outside its controlled unit tests. This makes pathological future/test seam limits a structured `Io` error before the reader's fixed allocation.
 
 Build the process only as:
 
@@ -185,12 +189,13 @@ On every iteration:
 
 1. drain available structured reader events;
 2. make overflow/read failure the primary operation failure even if child exit was already observed;
-3. poll `child.try_wait()` only until an exit status has been recorded;
-4. return success only when status plus both complete outputs exist;
-5. if the deadline is reached first, return timeout failure;
-6. sleep for at most the smaller of the poll interval and remaining deadline.
+3. after draining events, inspect stream-identified reader handles; a finished handle without its terminal outcome is an immediate reader-disappearance failure even if the sibling sender remains live;
+4. poll `child.try_wait()` only after both reader EOF outcomes exist, then only until an exit status has been recorded; this keeps an exited leader with open descendant pipes unreaped and its process-group identity pinned through timeout cleanup;
+5. return success only when status plus both complete outputs exist;
+6. if the deadline is reached first, return timeout failure;
+7. sleep for at most the smaller of the poll interval and remaining deadline.
 
-Channel disconnect before both complete outcomes is a reader failure. After cloning one sender into each reader, explicitly drop every parent-held `Sender`; this makes a reader panic/disappearance observable as channel disconnect rather than an artificial timeout. Join reader handles on success only after completion events make the join nonblocking. A join panic becomes `Io` and successful output is discarded.
+Channel disconnect before both complete outcomes is a reader failure. After cloning one sender into each reader, explicitly drop every parent-held `Sender`. Finished-handle inspection makes one reader's disappearance observable without waiting for its sibling sender to drop. Join reader handles on success only after completion events make the join nonblocking. A join panic becomes `Io` and successful output is discarded.
 
 - [ ] **Step 5: Implement bounded cleanup**
 
@@ -199,15 +204,15 @@ Create a cleanup helper that receives the child, whether its exit was already ob
 On Unix:
 
 - checked-convert `child.id()` to a positive `i32`;
+- if the direct child was already reaped after both reader EOFs, skip all numeric signaling and reaping;
 - send `SIGTERM` to the negative PID process group using narrowly scoped `libc::kill` with a SAFETY comment;
 - treat `ESRCH` as already gone;
-- for at most `termination_grace`, poll the unreaped direct child;
-- send `SIGKILL` to the same group after grace (again treating `ESRCH` as benign);
-- call `wait()` only when `try_wait()` has not already recorded/reaped the direct child.
+- keep the direct leader unreaped for `termination_grace`, then send `SIGKILL` to the same group while its PID identity remains pinned (again treating `ESRCH` as benign);
+- independently call `Child::kill()` for the direct child, then use only bounded `try_wait()` polling to reap it. A failed or ineffective kill must never be followed by blocking `wait()`.
 
-On non-Unix, use `Child::kill()` and wait only if not already reaped.
+On non-Unix, use the same direct-child kill plus bounded `try_wait()` polling when not already reaped.
 
-After termination, poll reader `JoinHandle::is_finished()` and drain events for at most `reader_close_grace`. Join only finished handles. Drop/detach an unfinished handle rather than blocking. Preserve the original timeout/output/read/setup reason and append cleanup details if kill, wait, or join fails.
+After termination, poll reader `JoinHandle::is_finished()` and drain events for at most `reader_close_grace`. Join only finished handles. Drop/detach an unfinished handle rather than blocking. Preserve the original timeout/output/read/setup reason and append cleanup details if kill, bounded-reap polling, or join fails.
 
 Never return partial stdout/stderr for an abnormal operation.
 
@@ -231,10 +236,11 @@ Expected: all new supervision cases and all existing tests pass with no warnings
 
 **Files:**
 
+- Modify: `Cargo.toml` (existing Unix `libc` dependency-scope comment only)
 - Modify: `src/macos/codesign.rs` (focused bounded-runner error regression only)
-- Verify: `src/macos/command.rs`
-- Verify: `docs/superpowers/specs/2026-08-09-native-command-bounds-design.md`
-- Verify: `docs/superpowers/plans/2026-08-09-native-command-bounds.md`
+- Modify: `src/macos/command.rs`
+- Modify: `docs/superpowers/specs/2026-08-09-native-command-bounds-design.md` (reviewed lifecycle corrections)
+- Modify: `docs/superpowers/plans/2026-08-09-native-command-bounds.md`
 
 - [ ] **Step 1: Add/confirm integration assertions**
 
@@ -273,7 +279,7 @@ git diff --check
 git status --short
 ```
 
-Expected: every command exits zero; test count is greater than 129; only the hardening implementation and plan are uncommitted.
+Expected: every command exits zero; test count is greater than 129; only the five reviewed module files named in Step 7 are modified.
 
 - [ ] **Step 4: Perform read-only macOS smoke validation**
 
@@ -310,11 +316,9 @@ Repeat Step 3 after the final review. Do not rely on delegated or earlier output
 Stage only reviewed module files:
 
 ```text
-git add src/macos/command.rs src/macos/codesign.rs docs/superpowers/plans/2026-08-09-native-command-bounds.md
+git add Cargo.toml src/macos/command.rs src/macos/codesign.rs docs/superpowers/specs/2026-08-09-native-command-bounds-design.md docs/superpowers/plans/2026-08-09-native-command-bounds.md
 git commit -m "fix(macos): bound native commands"
 ```
-
-Omit `src/macos/codesign.rs` if no integration change was necessary. The already committed design spec must not be recommitted.
 
 - [ ] **Step 8: Push the completed module branch**
 
