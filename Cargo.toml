@@ -10,10 +10,14 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
+der = "=0.7.10"
 goblin = "0.10.7"
 hex = "0.4.3"
 sha2 = "0.11.0"
 yara-x = "1.19.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = "=0.8.7"
 
 # Narrowly scoped to Unix artifact opens and native-command process-group cleanup.
 [target.'cfg(unix)'.dependencies]

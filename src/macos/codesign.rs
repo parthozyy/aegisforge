@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use crate::macos::command::SystemCommandRunner;
 use crate::macos::command::{NativeCommandError, NativeCommandOutput, NativeCommandRunner};
+use crate::macos::entitlements::{EntitlementEntry, EntitlementSource};
 use crate::scanner::result::{DiagnosticKind, ScanDiagnostic};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -76,13 +77,93 @@ impl SignatureKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeFactScope {
+    #[cfg_attr(not(test), allow(dead_code))]
+    AllArchitectures,
+    #[cfg_attr(not(test), allow(dead_code))]
+    SingleArchitecture,
+    #[cfg_attr(not(test), allow(dead_code))]
+    SelectedArchitecture,
+    Unknown,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl NativeFactScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllArchitectures => "ALL_ARCHITECTURES",
+            Self::SingleArchitecture => "SINGLE_ARCHITECTURE",
+            Self::SelectedArchitecture => "SELECTED_ARCHITECTURE",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CodeSignatureArchitecture {
+    pub cpu_type: i32,
+    pub cpu_subtype: i32,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub display_label: String,
+}
+
+impl PartialEq for CodeSignatureArchitecture {
+    fn eq(&self, other: &Self) -> bool {
+        (self.cpu_type, self.cpu_subtype) == (other.cpu_type, other.cpu_subtype)
+    }
+}
+
+impl Eq for CodeSignatureArchitecture {}
+
+impl PartialOrd for CodeSignatureArchitecture {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CodeSignatureArchitecture {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.cpu_type, self.cpu_subtype).cmp(&(other.cpu_type, other.cpu_subtype))
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CodeSignatureArchitecture {
+    pub fn new(cpu_type: i32, cpu_subtype: i32) -> Self {
+        use goblin::mach::constants::cputype::{CPU_SUBTYPE_MASK, get_arch_name_from_types};
+
+        let lookup_subtype = (cpu_subtype as u32) & !CPU_SUBTYPE_MASK;
+        let display_label = get_arch_name_from_types(cpu_type as u32, lookup_subtype)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("cpu_type={cpu_type},cpu_subtype={cpu_subtype}"));
+
+        Self {
+            cpu_type,
+            cpu_subtype,
+            display_label,
+        }
+    }
+
+    pub fn codesign_selector(&self) -> String {
+        format!("{},{}", self.cpu_type, self.cpu_subtype)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeSignatureInspection {
     pub target: PathBuf,
     pub target_kind: CodeSignatureTargetKind,
+    pub native_fact_scope: NativeFactScope,
+    pub selected_architecture: Option<CodeSignatureArchitecture>,
+    pub available_architectures: Vec<CodeSignatureArchitecture>,
     pub presence: SignaturePresence,
     pub verification_status: NativeCheckStatus,
     pub metadata_status: NativeCheckStatus,
+    pub der_entitlements_status: NativeCheckStatus,
+    pub entitlements_status: NativeCheckStatus,
+    pub entitlement_source: Option<EntitlementSource>,
+    pub entitlements: Vec<EntitlementEntry>,
     pub identifier: Option<String>,
     pub team_identifier: Option<String>,
     pub authorities: Vec<String>,
@@ -97,9 +178,16 @@ impl CodeSignatureInspection {
         Self {
             target,
             target_kind,
+            native_fact_scope: NativeFactScope::Unknown,
+            selected_architecture: None,
+            available_architectures: Vec::new(),
             presence: SignaturePresence::Unknown,
             verification_status: NativeCheckStatus::Error,
             metadata_status: NativeCheckStatus::Error,
+            der_entitlements_status: NativeCheckStatus::Error,
+            entitlements_status: NativeCheckStatus::Error,
+            entitlement_source: None,
+            entitlements: Vec::new(),
             identifier: None,
             team_identifier: None,
             authorities: Vec::new(),
@@ -576,9 +664,16 @@ fn reconcile(
     CodeSignatureInspection {
         target: target.to_path_buf(),
         target_kind,
+        native_fact_scope: NativeFactScope::Unknown,
+        selected_architecture: None,
+        available_architectures: Vec::new(),
         presence,
         verification_status: verification.status,
         metadata_status: metadata.status,
+        der_entitlements_status: NativeCheckStatus::Error,
+        entitlements_status: NativeCheckStatus::Error,
+        entitlement_source: None,
+        entitlements: Vec::new(),
         identifier,
         team_identifier,
         authorities: parsed.authorities,
@@ -731,7 +826,7 @@ pub fn platform_code_signature_inspector() -> PlatformCodeSignatureInspector {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, VecDeque};
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -915,6 +1010,83 @@ mod tests {
     }
 
     #[test]
+    fn native_fact_scope_has_stable_labels() {
+        assert_eq!(
+            NativeFactScope::AllArchitectures.as_str(),
+            "ALL_ARCHITECTURES"
+        );
+        assert_eq!(
+            NativeFactScope::SingleArchitecture.as_str(),
+            "SINGLE_ARCHITECTURE"
+        );
+        assert_eq!(
+            NativeFactScope::SelectedArchitecture.as_str(),
+            "SELECTED_ARCHITECTURE"
+        );
+        assert_eq!(NativeFactScope::Unknown.as_str(), "UNKNOWN");
+    }
+
+    #[test]
+    fn architecture_has_exact_selector_and_known_label() {
+        let architecture = CodeSignatureArchitecture::new(16_777_228, 2);
+
+        assert_eq!(architecture.cpu_type, 16_777_228);
+        assert_eq!(architecture.cpu_subtype, 2);
+        assert_eq!(architecture.display_label, "arm64e");
+        assert_eq!(architecture.codesign_selector(), "16777228,2");
+    }
+
+    #[test]
+    fn architecture_masks_capability_bits_only_for_label_lookup() {
+        let subtype_with_capability = (0x8000_0000_u32 | 2) as i32;
+        let architecture = CodeSignatureArchitecture::new(16_777_228, subtype_with_capability);
+
+        assert_eq!(architecture.display_label, "arm64e");
+        assert_eq!(architecture.cpu_subtype, subtype_with_capability);
+        assert_eq!(
+            architecture.codesign_selector(),
+            format!("16777228,{subtype_with_capability}")
+        );
+    }
+
+    #[test]
+    fn architecture_fallback_label_is_deterministic_and_numeric() {
+        let first = CodeSignatureArchitecture::new(123, -456);
+        let second = CodeSignatureArchitecture::new(123, -456);
+
+        assert_eq!(first, second);
+        assert_eq!(first.display_label, "cpu_type=123,cpu_subtype=-456");
+        assert_eq!(first.codesign_selector(), "123,-456");
+    }
+
+    #[test]
+    fn architecture_order_uses_the_raw_signed_tuple() {
+        let lower_subtype = CodeSignatureArchitecture::new(7, -1);
+        let higher_subtype = CodeSignatureArchitecture::new(7, 0);
+        let higher_type = CodeSignatureArchitecture::new(8, i32::MIN);
+
+        assert!(lower_subtype < higher_subtype);
+        assert!(higher_subtype < higher_type);
+    }
+
+    #[test]
+    fn architecture_identity_ignores_display_label() {
+        let first = CodeSignatureArchitecture {
+            cpu_type: 16_777_228,
+            cpu_subtype: 2,
+            display_label: "arm64e".to_string(),
+        };
+        let relabeled = CodeSignatureArchitecture {
+            display_label: "deliberately different".to_string(),
+            ..first.clone()
+        };
+
+        assert_eq!(first, relabeled);
+        assert_eq!(first.cmp(&relabeled), std::cmp::Ordering::Equal);
+        assert_eq!(BTreeSet::from([first, relabeled]).len(), 1);
+    }
+
+    #[test]
     fn target_kinds_remain_distinct_in_constructed_inspections() {
         let file = CodeSignatureInspection::unknown(
             PathBuf::from("sample"),
@@ -945,6 +1117,13 @@ mod tests {
         assert_eq!(inspection.presence, SignaturePresence::Unknown);
         assert_eq!(inspection.verification_status, NativeCheckStatus::Error);
         assert_eq!(inspection.metadata_status, NativeCheckStatus::Error);
+        assert_eq!(inspection.native_fact_scope, NativeFactScope::Unknown);
+        assert_eq!(inspection.selected_architecture, None);
+        assert!(inspection.available_architectures.is_empty());
+        assert_eq!(inspection.der_entitlements_status, NativeCheckStatus::Error);
+        assert_eq!(inspection.entitlements_status, NativeCheckStatus::Error);
+        assert_eq!(inspection.entitlement_source, None);
+        assert!(inspection.entitlements.is_empty());
         assert_eq!(inspection.identifier, None);
         assert_eq!(inspection.team_identifier, None);
         assert!(inspection.authorities.is_empty());
@@ -952,6 +1131,72 @@ mod tests {
         assert_eq!(inspection.hardened_runtime, None);
         assert_eq!(inspection.verification_detail, None);
         assert!(inspection.diagnostics.is_empty());
+    }
+
+    fn native_fact_scope_fields_are_valid(inspection: &CodeSignatureInspection) -> bool {
+        let has_no_selected_facts = inspection.identifier.is_none()
+            && inspection.team_identifier.is_none()
+            && inspection.authorities.is_empty()
+            && inspection.signature_kind == SignatureKind::Unknown
+            && inspection.hardened_runtime.is_none()
+            && inspection.entitlement_source.is_none()
+            && inspection.entitlements.is_empty();
+
+        match inspection.native_fact_scope {
+            NativeFactScope::Unknown | NativeFactScope::AllArchitectures => {
+                inspection.selected_architecture.is_none()
+                    && inspection.available_architectures.is_empty()
+                    && has_no_selected_facts
+            }
+            NativeFactScope::SingleArchitecture => inspection
+                .selected_architecture
+                .as_ref()
+                .is_some_and(|selected| {
+                    inspection.available_architectures.as_slice() == std::slice::from_ref(selected)
+                }),
+            NativeFactScope::SelectedArchitecture => {
+                inspection.available_architectures.len() >= 2
+                    && inspection
+                        .selected_architecture
+                        .as_ref()
+                        .is_some_and(|selected| {
+                            inspection.available_architectures.contains(selected)
+                        })
+            }
+        }
+    }
+
+    #[test]
+    fn native_fact_scope_examples_obey_field_invariants() {
+        let target = PathBuf::from("sample");
+        let first = CodeSignatureArchitecture::new(7, 3);
+        let second = CodeSignatureArchitecture::new(16_777_228, 0);
+
+        let unknown =
+            CodeSignatureInspection::unknown(target.clone(), CodeSignatureTargetKind::MachOFile);
+
+        let mut all =
+            CodeSignatureInspection::unknown(target.clone(), CodeSignatureTargetKind::MachOFile);
+        all.native_fact_scope = NativeFactScope::AllArchitectures;
+        all.presence = SignaturePresence::Signed;
+        all.verification_status = NativeCheckStatus::Passed;
+
+        let mut single =
+            CodeSignatureInspection::unknown(target.clone(), CodeSignatureTargetKind::MachOFile);
+        single.native_fact_scope = NativeFactScope::SingleArchitecture;
+        single.selected_architecture = Some(first.clone());
+        single.available_architectures = vec![first.clone()];
+
+        let mut selected =
+            CodeSignatureInspection::unknown(target, CodeSignatureTargetKind::MachOFile);
+        selected.native_fact_scope = NativeFactScope::SelectedArchitecture;
+        selected.selected_architecture = Some(first.clone());
+        selected.available_architectures = vec![first, second];
+
+        assert!(native_fact_scope_fields_are_valid(&unknown));
+        assert!(native_fact_scope_fields_are_valid(&all));
+        assert!(native_fact_scope_fields_are_valid(&single));
+        assert!(native_fact_scope_fields_are_valid(&selected));
     }
 
     #[test]

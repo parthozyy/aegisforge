@@ -431,20 +431,14 @@ mod tests {
     }
 
     fn signature(target: &str, target_kind: CodeSignatureTargetKind) -> CodeSignatureInspection {
-        CodeSignatureInspection {
-            target: PathBuf::from(target),
-            target_kind,
-            presence: SignaturePresence::Signed,
-            verification_status: NativeCheckStatus::Passed,
-            metadata_status: NativeCheckStatus::Passed,
-            identifier: Some("com.example.tool".to_string()),
-            team_identifier: None,
-            authorities: Vec::new(),
-            signature_kind: SignatureKind::AdHoc,
-            hardened_runtime: Some(false),
-            verification_detail: None,
-            diagnostics: Vec::new(),
-        }
+        let mut inspection = CodeSignatureInspection::unknown(PathBuf::from(target), target_kind);
+        inspection.presence = SignaturePresence::Signed;
+        inspection.verification_status = NativeCheckStatus::Passed;
+        inspection.metadata_status = NativeCheckStatus::Passed;
+        inspection.identifier = Some("com.example.tool".to_string());
+        inspection.signature_kind = SignatureKind::AdHoc;
+        inspection.hardened_runtime = Some(false);
+        inspection
     }
 
     #[test]
