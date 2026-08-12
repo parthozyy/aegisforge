@@ -1,0 +1,20 @@
+[package]
+name = "aegisforge"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight, local-first security utility for macOS"
+
+[[bin]]
+name = "af"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+goblin = "0.10.7"
+hex = "0.4.3"
+sha2 = "0.11.0"
+yara-x = "1.19.0"
+
+# Narrowly scoped to Unix artifact opens using O_NOFOLLOW | O_NONBLOCK.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
