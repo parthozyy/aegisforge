@@ -5,10 +5,13 @@ use der::{
     asn1::{AnyRef, OctetStringRef, Utf8StringRef},
 };
 
+use crate::macos::codesign::NativeCheckStatus;
+
 pub const MAX_ENTITLEMENT_BYTES: usize = 256 * 1024;
 pub const MAX_ENTITLEMENT_DEPTH: usize = 32;
 pub const MAX_ENTITLEMENT_NODES: usize = 4_096;
 pub const MAX_ENTITLEMENT_MATERIALIZED_BYTES: usize = 256 * 1024;
+const MAX_RECONCILIATION_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 #[cfg_attr(not(test), allow(dead_code))]
 pub const MAX_ENTITLEMENT_REPORT_BYTES: usize = 3 * 1024 * 1024;
 
@@ -66,6 +69,245 @@ impl EntitlementSource {
             Self::LegacyPropertyListNonAuthoritative => "LEGACY_PROPERTY_LIST_NON_AUTHORITATIVE",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DerEntitlementObservation {
+    #[cfg_attr(not(test), allow(dead_code))]
+    Parsed { entries: Vec<EntitlementEntry> },
+    #[cfg_attr(not(test), allow(dead_code))]
+    Absent,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Unsigned,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Failed { reason: String },
+    #[cfg_attr(not(test), allow(dead_code))]
+    Unavailable { reason: String },
+    #[cfg_attr(not(test), allow(dead_code))]
+    Error { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReconciledEntitlements {
+    pub(crate) der_entitlements_status: NativeCheckStatus,
+    pub(crate) entitlements_status: NativeCheckStatus,
+    pub(crate) entitlement_source: Option<EntitlementSource>,
+    pub(crate) entitlements: Vec<EntitlementEntry>,
+    pub(crate) positive_signed: bool,
+    pub(crate) explicit_unsigned: bool,
+    pub(crate) diagnostics: Vec<String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn reconcile_entitlements(
+    der: DerEntitlementObservation,
+    legacy: LegacyEntitlementObservation,
+) -> ReconciledEntitlements {
+    let (der_entitlements_status, positive_signed, explicit_unsigned) = match &der {
+        DerEntitlementObservation::Parsed { .. } => (NativeCheckStatus::Passed, true, false),
+        DerEntitlementObservation::Absent => (NativeCheckStatus::NotApplicable, true, false),
+        DerEntitlementObservation::Unsigned => (NativeCheckStatus::NotApplicable, false, true),
+        DerEntitlementObservation::Failed { .. } => (NativeCheckStatus::Failed, false, false),
+        DerEntitlementObservation::Unavailable { .. } => {
+            (NativeCheckStatus::Unavailable, false, false)
+        }
+        DerEntitlementObservation::Error { .. } => (NativeCheckStatus::Error, false, false),
+    };
+
+    let mut reconciled = ReconciledEntitlements {
+        der_entitlements_status,
+        entitlements_status: der_entitlements_status,
+        entitlement_source: None,
+        entitlements: Vec::new(),
+        positive_signed,
+        explicit_unsigned,
+        diagnostics: Vec::new(),
+    };
+
+    match &der {
+        DerEntitlementObservation::Failed { reason } => push_reconciliation_diagnostic(
+            &mut reconciled,
+            &["DER entitlement query failed: ", reason],
+        ),
+        DerEntitlementObservation::Unavailable { reason } => push_reconciliation_diagnostic(
+            &mut reconciled,
+            &["DER entitlement query unavailable: ", reason],
+        ),
+        DerEntitlementObservation::Error { reason } => push_reconciliation_diagnostic(
+            &mut reconciled,
+            &["DER entitlement query error: ", reason],
+        ),
+        DerEntitlementObservation::Parsed { .. }
+        | DerEntitlementObservation::Absent
+        | DerEntitlementObservation::Unsigned => {}
+    }
+
+    match (der, legacy) {
+        (DerEntitlementObservation::Parsed { entries }, LegacyEntitlementObservation::Absent) => {
+            retain_der_entries(&mut reconciled, entries)
+        }
+        (
+            DerEntitlementObservation::Parsed { entries },
+            LegacyEntitlementObservation::Unobserved { reason },
+        ) => {
+            retain_der_entries(&mut reconciled, entries);
+            push_reconciliation_diagnostic(
+                &mut reconciled,
+                &["legacy entitlement comparison was unavailable: ", &reason],
+            );
+        }
+        (
+            DerEntitlementObservation::Parsed { entries },
+            LegacyEntitlementObservation::Valid {
+                format: _,
+                entries: legacy_entries,
+            },
+        ) if entries == legacy_entries => retain_der_entries(&mut reconciled, entries),
+        (DerEntitlementObservation::Parsed { .. }, LegacyEntitlementObservation::Valid { .. }) => {
+            reconciled.entitlements_status = NativeCheckStatus::Error;
+            push_reconciliation_diagnostic(
+                &mut reconciled,
+                &["authoritative DER and legacy entitlement dictionaries disagree"],
+            );
+        }
+        (DerEntitlementObservation::Absent, LegacyEntitlementObservation::Absent)
+        | (DerEntitlementObservation::Unsigned, LegacyEntitlementObservation::Absent) => {}
+        (
+            DerEntitlementObservation::Absent,
+            LegacyEntitlementObservation::Unobserved { reason },
+        )
+        | (
+            DerEntitlementObservation::Unsigned,
+            LegacyEntitlementObservation::Unobserved { reason },
+        ) => push_reconciliation_diagnostic(
+            &mut reconciled,
+            &["legacy entitlement comparison was unavailable: ", &reason],
+        ),
+        (DerEntitlementObservation::Absent, LegacyEntitlementObservation::Valid { .. }) => {
+            reconciled.entitlements_status = NativeCheckStatus::Error;
+            push_reconciliation_diagnostic(
+                &mut reconciled,
+                &["authoritative DER absence conflicts with a legacy entitlement dictionary"],
+            );
+        }
+        (DerEntitlementObservation::Unsigned, LegacyEntitlementObservation::Valid { .. }) => {
+            reconciled.entitlements_status = NativeCheckStatus::Error;
+            push_reconciliation_diagnostic(
+                &mut reconciled,
+                &[
+                    "authoritative unsigned DER observation conflicts with a legacy entitlement dictionary",
+                ],
+            );
+        }
+        (
+            DerEntitlementObservation::Failed { reason },
+            LegacyEntitlementObservation::Valid { entries, .. },
+        )
+        | (
+            DerEntitlementObservation::Unavailable { reason },
+            LegacyEntitlementObservation::Valid { entries, .. },
+        )
+        | (
+            DerEntitlementObservation::Error { reason },
+            LegacyEntitlementObservation::Valid { entries, .. },
+        ) => {
+            reconciled.entitlements_status = NativeCheckStatus::Error;
+            reconciled.entitlement_source =
+                Some(EntitlementSource::LegacyPropertyListNonAuthoritative);
+            reconciled.entitlements = entries;
+            push_reconciliation_diagnostic(
+                &mut reconciled,
+                &[
+                    "no authoritative DER entitlement observation was established (",
+                    der_entitlements_status.as_str(),
+                    ": ",
+                    &reason,
+                    "); retaining non-authoritative legacy compatibility context",
+                ],
+            );
+        }
+        (DerEntitlementObservation::Failed { .. }, LegacyEntitlementObservation::Absent)
+        | (DerEntitlementObservation::Unavailable { .. }, LegacyEntitlementObservation::Absent)
+        | (DerEntitlementObservation::Error { .. }, LegacyEntitlementObservation::Absent) => {}
+        (
+            DerEntitlementObservation::Failed { .. },
+            LegacyEntitlementObservation::Unobserved { reason },
+        )
+        | (
+            DerEntitlementObservation::Unavailable { .. },
+            LegacyEntitlementObservation::Unobserved { reason },
+        )
+        | (
+            DerEntitlementObservation::Error { .. },
+            LegacyEntitlementObservation::Unobserved { reason },
+        ) => push_reconciliation_diagnostic(
+            &mut reconciled,
+            &["legacy entitlement comparison was unavailable: ", &reason],
+        ),
+        (_, LegacyEntitlementObservation::Invalid { reason }) => {
+            reconciled.entitlements_status = NativeCheckStatus::Error;
+            reconciled.entitlement_source = None;
+            reconciled.entitlements.clear();
+            push_reconciliation_diagnostic(
+                &mut reconciled,
+                &["legacy entitlement observation is invalid: ", &reason],
+            );
+        }
+    }
+
+    if reconciled.der_entitlements_status != reconciled.entitlements_status {
+        let der_status = reconciled.der_entitlements_status.as_str();
+        let final_status = reconciled.entitlements_status.as_str();
+        push_reconciliation_diagnostic(
+            &mut reconciled,
+            &[
+                "entitlement status comparison: DER ",
+                der_status,
+                "; final ",
+                final_status,
+            ],
+        );
+    }
+    reconciled.diagnostics.sort_unstable();
+    reconciled.diagnostics.dedup();
+
+    reconciled
+}
+
+fn retain_der_entries(reconciled: &mut ReconciledEntitlements, entries: Vec<EntitlementEntry>) {
+    reconciled.entitlement_source = Some(EntitlementSource::CodesignDerOutput);
+    reconciled.entitlements = entries;
+}
+
+fn push_reconciliation_diagnostic(reconciled: &mut ReconciledEntitlements, parts: &[&str]) {
+    const TRUNCATED_SUFFIX: &str = "[truncated]";
+    let mut diagnostic = String::with_capacity(MAX_RECONCILIATION_DIAGNOSTIC_BYTES);
+    let mut truncated = false;
+    for part in parts {
+        let remaining = MAX_RECONCILIATION_DIAGNOSTIC_BYTES - diagnostic.len();
+        if part.len() <= remaining {
+            diagnostic.push_str(part);
+            continue;
+        }
+
+        let mut end = remaining;
+        while end > 0 && !part.is_char_boundary(end) {
+            end -= 1;
+        }
+        diagnostic.push_str(&part[..end]);
+        truncated = true;
+        break;
+    }
+    if truncated {
+        let maximum_prefix = MAX_RECONCILIATION_DIAGNOSTIC_BYTES - TRUNCATED_SUFFIX.len();
+        let mut end = diagnostic.len().min(maximum_prefix);
+        while end > 0 && !diagnostic.is_char_boundary(end) {
+            end -= 1;
+        }
+        diagnostic.truncate(end);
+        diagnostic.push_str(TRUNCATED_SUFFIX);
+    }
+    reconciled.diagnostics.push(diagnostic);
 }
 
 pub(crate) struct EntitlementBudget {
@@ -1669,5 +1911,639 @@ mod tests {
 
         assert!(budget.charge_materialized(1).is_err());
         assert_eq!(budget.materialized_bytes, usize::MAX);
+    }
+
+    fn reconciliation_entries(key: &str) -> Vec<EntitlementEntry> {
+        vec![EntitlementEntry {
+            key: key.to_string(),
+            value: EntitlementValue::Boolean(true),
+        }]
+    }
+
+    #[test]
+    fn reconcile_entitlements_covers_the_complete_status_matrix() {
+        use crate::macos::codesign::NativeCheckStatus;
+
+        #[derive(Debug)]
+        struct Case {
+            name: &'static str,
+            der: DerEntitlementObservation,
+            legacy: LegacyEntitlementObservation,
+            expected_der_status: NativeCheckStatus,
+            expected_final_status: NativeCheckStatus,
+            expected_source: Option<EntitlementSource>,
+            expected_entries: Vec<EntitlementEntry>,
+            expected_positive_signed: bool,
+            expected_explicit_unsigned: bool,
+        }
+
+        let authoritative = reconciliation_entries("authoritative");
+        let different = reconciliation_entries("different");
+        let compatibility = reconciliation_entries("compatibility");
+        let cases = vec![
+            Case {
+                name: "selector unavailable leaves DER unobserved",
+                der: DerEntitlementObservation::Error {
+                    reason: "selector unavailable".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Unobserved {
+                    reason: "selected dictionary unavailable".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::Error,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "parsed DER with absent legacy",
+                der: DerEntitlementObservation::Parsed {
+                    entries: authoritative.clone(),
+                },
+                legacy: LegacyEntitlementObservation::Absent,
+                expected_der_status: NativeCheckStatus::Passed,
+                expected_final_status: NativeCheckStatus::Passed,
+                expected_source: Some(EntitlementSource::CodesignDerOutput),
+                expected_entries: authoritative.clone(),
+                expected_positive_signed: true,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "parsed DER with unobserved legacy",
+                der: DerEntitlementObservation::Parsed {
+                    entries: authoritative.clone(),
+                },
+                legacy: LegacyEntitlementObservation::Unobserved {
+                    reason: "full dictionary unavailable".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::Passed,
+                expected_final_status: NativeCheckStatus::Passed,
+                expected_source: Some(EntitlementSource::CodesignDerOutput),
+                expected_entries: authoritative.clone(),
+                expected_positive_signed: true,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "parsed DER with equal legacy",
+                der: DerEntitlementObservation::Parsed {
+                    entries: authoritative.clone(),
+                },
+                legacy: LegacyEntitlementObservation::Valid {
+                    format: LegacyFormat::Xml,
+                    entries: authoritative.clone(),
+                },
+                expected_der_status: NativeCheckStatus::Passed,
+                expected_final_status: NativeCheckStatus::Passed,
+                expected_source: Some(EntitlementSource::CodesignDerOutput),
+                expected_entries: authoritative.clone(),
+                expected_positive_signed: true,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "parsed DER with different legacy",
+                der: DerEntitlementObservation::Parsed {
+                    entries: authoritative.clone(),
+                },
+                legacy: LegacyEntitlementObservation::Valid {
+                    format: LegacyFormat::Binary,
+                    entries: different.clone(),
+                },
+                expected_der_status: NativeCheckStatus::Passed,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: true,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "parsed DER with invalid legacy",
+                der: DerEntitlementObservation::Parsed {
+                    entries: authoritative.clone(),
+                },
+                legacy: LegacyEntitlementObservation::Invalid {
+                    reason: "legacy blob is malformed".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::Passed,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: true,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "zero-byte absence with absent legacy",
+                der: DerEntitlementObservation::Absent,
+                legacy: LegacyEntitlementObservation::Absent,
+                expected_der_status: NativeCheckStatus::NotApplicable,
+                expected_final_status: NativeCheckStatus::NotApplicable,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: true,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "zero-byte absence with unobserved legacy",
+                der: DerEntitlementObservation::Absent,
+                legacy: LegacyEntitlementObservation::Unobserved {
+                    reason: "legacy dictionary unobserved".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::NotApplicable,
+                expected_final_status: NativeCheckStatus::NotApplicable,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: true,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "zero-byte absence with valid legacy",
+                der: DerEntitlementObservation::Absent,
+                legacy: LegacyEntitlementObservation::Valid {
+                    format: LegacyFormat::Xml,
+                    entries: compatibility.clone(),
+                },
+                expected_der_status: NativeCheckStatus::NotApplicable,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: true,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "zero-byte absence with invalid legacy",
+                der: DerEntitlementObservation::Absent,
+                legacy: LegacyEntitlementObservation::Invalid {
+                    reason: "legacy pair incomplete".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::NotApplicable,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: true,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "exact unsigned with absent legacy",
+                der: DerEntitlementObservation::Unsigned,
+                legacy: LegacyEntitlementObservation::Absent,
+                expected_der_status: NativeCheckStatus::NotApplicable,
+                expected_final_status: NativeCheckStatus::NotApplicable,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: true,
+            },
+            Case {
+                name: "exact unsigned with unobserved legacy",
+                der: DerEntitlementObservation::Unsigned,
+                legacy: LegacyEntitlementObservation::Unobserved {
+                    reason: "legacy dictionary unobserved".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::NotApplicable,
+                expected_final_status: NativeCheckStatus::NotApplicable,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: true,
+            },
+            Case {
+                name: "exact unsigned with valid legacy",
+                der: DerEntitlementObservation::Unsigned,
+                legacy: LegacyEntitlementObservation::Valid {
+                    format: LegacyFormat::Binary,
+                    entries: compatibility.clone(),
+                },
+                expected_der_status: NativeCheckStatus::NotApplicable,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: true,
+            },
+            Case {
+                name: "exact unsigned with invalid legacy",
+                der: DerEntitlementObservation::Unsigned,
+                legacy: LegacyEntitlementObservation::Invalid {
+                    reason: "legacy value type unsupported".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::NotApplicable,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: true,
+            },
+            Case {
+                name: "command rejection with absent legacy",
+                der: DerEntitlementObservation::Failed {
+                    reason: "codesign rejected the request".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Absent,
+                expected_der_status: NativeCheckStatus::Failed,
+                expected_final_status: NativeCheckStatus::Failed,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "command rejection with unobserved legacy",
+                der: DerEntitlementObservation::Failed {
+                    reason: "codesign rejected the request".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Unobserved {
+                    reason: "legacy dictionary unobserved".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::Failed,
+                expected_final_status: NativeCheckStatus::Failed,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "command rejection with valid legacy compatibility context",
+                der: DerEntitlementObservation::Failed {
+                    reason: "codesign rejected the request".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Valid {
+                    format: LegacyFormat::Xml,
+                    entries: compatibility.clone(),
+                },
+                expected_der_status: NativeCheckStatus::Failed,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: Some(EntitlementSource::LegacyPropertyListNonAuthoritative),
+                expected_entries: compatibility.clone(),
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "command rejection with invalid legacy",
+                der: DerEntitlementObservation::Failed {
+                    reason: "codesign rejected the request".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Invalid {
+                    reason: "legacy blob is malformed".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::Failed,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "runner unavailable with absent legacy",
+                der: DerEntitlementObservation::Unavailable {
+                    reason: "codesign is unavailable".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Absent,
+                expected_der_status: NativeCheckStatus::Unavailable,
+                expected_final_status: NativeCheckStatus::Unavailable,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "runner unavailable with unobserved legacy",
+                der: DerEntitlementObservation::Unavailable {
+                    reason: "codesign is unavailable".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Unobserved {
+                    reason: "legacy dictionary unobserved".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::Unavailable,
+                expected_final_status: NativeCheckStatus::Unavailable,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "runner unavailable with valid legacy compatibility context",
+                der: DerEntitlementObservation::Unavailable {
+                    reason: "codesign is unavailable".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Valid {
+                    format: LegacyFormat::Binary,
+                    entries: compatibility.clone(),
+                },
+                expected_der_status: NativeCheckStatus::Unavailable,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: Some(EntitlementSource::LegacyPropertyListNonAuthoritative),
+                expected_entries: compatibility.clone(),
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "runner unavailable with invalid legacy",
+                der: DerEntitlementObservation::Unavailable {
+                    reason: "codesign is unavailable".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Invalid {
+                    reason: "legacy blob is malformed".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::Unavailable,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "runner or parser error with absent legacy",
+                der: DerEntitlementObservation::Error {
+                    reason: "DER output is malformed".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Absent,
+                expected_der_status: NativeCheckStatus::Error,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "runner or parser error with unobserved legacy",
+                der: DerEntitlementObservation::Error {
+                    reason: "DER stderr framing is invalid".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Unobserved {
+                    reason: "legacy dictionary unobserved".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::Error,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "runner or parser error with valid legacy compatibility context",
+                der: DerEntitlementObservation::Error {
+                    reason: "DER output exceeds its bound".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Valid {
+                    format: LegacyFormat::Xml,
+                    entries: compatibility.clone(),
+                },
+                expected_der_status: NativeCheckStatus::Error,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: Some(EntitlementSource::LegacyPropertyListNonAuthoritative),
+                expected_entries: compatibility.clone(),
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+            Case {
+                name: "runner or parser error with invalid legacy",
+                der: DerEntitlementObservation::Error {
+                    reason: "DER output is malformed".to_string(),
+                },
+                legacy: LegacyEntitlementObservation::Invalid {
+                    reason: "legacy blob is malformed".to_string(),
+                },
+                expected_der_status: NativeCheckStatus::Error,
+                expected_final_status: NativeCheckStatus::Error,
+                expected_source: None,
+                expected_entries: vec![],
+                expected_positive_signed: false,
+                expected_explicit_unsigned: false,
+            },
+        ];
+
+        for case in cases {
+            let reconciled = reconcile_entitlements(case.der, case.legacy);
+            assert_eq!(
+                reconciled.der_entitlements_status, case.expected_der_status,
+                "{}: DER status must remain independently truthful",
+                case.name
+            );
+            assert_eq!(
+                reconciled.entitlements_status, case.expected_final_status,
+                "{}: final status",
+                case.name
+            );
+            assert_eq!(
+                reconciled.entitlement_source, case.expected_source,
+                "{}: source",
+                case.name
+            );
+            assert_eq!(
+                reconciled.entitlements, case.expected_entries,
+                "{}: facts",
+                case.name
+            );
+            assert_eq!(
+                reconciled.positive_signed, case.expected_positive_signed,
+                "{}: accepted signed observation",
+                case.name
+            );
+            assert_eq!(
+                reconciled.explicit_unsigned, case.expected_explicit_unsigned,
+                "{}: explicit unsigned observation",
+                case.name
+            );
+            if case.expected_der_status != case.expected_final_status {
+                let expected_comparison = format!(
+                    "DER {}; final {}",
+                    case.expected_der_status.as_str(),
+                    case.expected_final_status.as_str()
+                );
+                assert!(
+                    reconciled
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.contains(&expected_comparison)),
+                    "{}: differing DER/final statuses require a comparison diagnostic",
+                    case.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reconcile_entitlements_distinguishes_an_empty_dictionary_from_absence() {
+        use crate::macos::codesign::NativeCheckStatus;
+
+        let parsed = reconcile_entitlements(
+            DerEntitlementObservation::Parsed { entries: vec![] },
+            LegacyEntitlementObservation::Absent,
+        );
+        let absent = reconcile_entitlements(
+            DerEntitlementObservation::Absent,
+            LegacyEntitlementObservation::Absent,
+        );
+
+        assert_eq!(parsed.der_entitlements_status, NativeCheckStatus::Passed);
+        assert_eq!(parsed.entitlements_status, NativeCheckStatus::Passed);
+        assert_eq!(
+            parsed.entitlement_source,
+            Some(EntitlementSource::CodesignDerOutput)
+        );
+        assert!(parsed.entitlements.is_empty());
+        assert!(parsed.positive_signed);
+        assert!(!parsed.explicit_unsigned);
+
+        assert_eq!(
+            absent.der_entitlements_status,
+            NativeCheckStatus::NotApplicable
+        );
+        assert_eq!(absent.entitlements_status, NativeCheckStatus::NotApplicable);
+        assert_eq!(absent.entitlement_source, None);
+        assert!(absent.entitlements.is_empty());
+        assert!(absent.positive_signed);
+        assert!(!absent.explicit_unsigned);
+    }
+
+    #[test]
+    fn reconcile_entitlements_preserves_the_unsigned_observation_on_legacy_conflict() {
+        use crate::macos::codesign::NativeCheckStatus;
+
+        let reconciled = reconcile_entitlements(
+            DerEntitlementObservation::Unsigned,
+            LegacyEntitlementObservation::Valid {
+                format: LegacyFormat::Xml,
+                entries: reconciliation_entries("legacy-only"),
+            },
+        );
+
+        assert_eq!(
+            reconciled.der_entitlements_status,
+            NativeCheckStatus::NotApplicable
+        );
+        assert_eq!(reconciled.entitlements_status, NativeCheckStatus::Error);
+        assert!(reconciled.explicit_unsigned);
+        assert!(!reconciled.positive_signed);
+        assert_eq!(reconciled.entitlement_source, None);
+        assert!(reconciled.entitlements.is_empty());
+    }
+
+    #[test]
+    fn reconcile_entitlements_bounds_utf8_diagnostics_and_sorts_them_deterministically() {
+        const DIAGNOSTIC_LIMIT: usize = 4 * 1024;
+
+        let oversized = "🛡".repeat(DIAGNOSTIC_LIMIT);
+        let cases = [
+            reconcile_entitlements(
+                DerEntitlementObservation::Error {
+                    reason: oversized.clone(),
+                },
+                LegacyEntitlementObservation::Valid {
+                    format: LegacyFormat::Xml,
+                    entries: reconciliation_entries("legacy"),
+                },
+            ),
+            reconcile_entitlements(
+                DerEntitlementObservation::Parsed {
+                    entries: reconciliation_entries("der"),
+                },
+                LegacyEntitlementObservation::Invalid {
+                    reason: oversized.clone(),
+                },
+            ),
+            reconcile_entitlements(
+                DerEntitlementObservation::Parsed {
+                    entries: reconciliation_entries("der"),
+                },
+                LegacyEntitlementObservation::Unobserved { reason: oversized },
+            ),
+        ];
+
+        for reconciled in cases {
+            assert!(!reconciled.diagnostics.is_empty());
+            assert!(
+                reconciled
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.len() <= DIAGNOSTIC_LIMIT),
+                "every reconciliation diagnostic must obey the byte cap"
+            );
+            assert!(
+                reconciled
+                    .diagnostics
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]),
+                "diagnostics must be sorted and deduplicated"
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_entitlements_retains_empty_legacy_compatibility_context_with_a_source() {
+        use crate::macos::codesign::NativeCheckStatus;
+
+        let reconciled = reconcile_entitlements(
+            DerEntitlementObservation::Unavailable {
+                reason: "codesign unavailable".to_string(),
+            },
+            LegacyEntitlementObservation::Valid {
+                format: LegacyFormat::Binary,
+                entries: vec![],
+            },
+        );
+
+        assert_eq!(
+            reconciled.der_entitlements_status,
+            NativeCheckStatus::Unavailable
+        );
+        assert_eq!(reconciled.entitlements_status, NativeCheckStatus::Error);
+        assert_eq!(
+            reconciled.entitlement_source,
+            Some(EntitlementSource::LegacyPropertyListNonAuthoritative)
+        );
+        assert!(reconciled.entitlements.is_empty());
+    }
+
+    #[test]
+    fn reconcile_entitlements_preserves_every_der_failure_reason() {
+        let observations = [
+            DerEntitlementObservation::Failed {
+                reason: "bounded native rejection".to_string(),
+            },
+            DerEntitlementObservation::Unavailable {
+                reason: "codesign missing".to_string(),
+            },
+            DerEntitlementObservation::Error {
+                reason: "runner timed out".to_string(),
+            },
+        ];
+
+        for observation in observations {
+            let expected_reason = match &observation {
+                DerEntitlementObservation::Failed { reason }
+                | DerEntitlementObservation::Unavailable { reason }
+                | DerEntitlementObservation::Error { reason } => reason.clone(),
+                _ => unreachable!("fixture contains only DER failures"),
+            };
+            let reconciled =
+                reconcile_entitlements(observation, LegacyEntitlementObservation::Absent);
+            assert!(
+                reconciled
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.contains(&expected_reason)),
+                "DER failure reason must survive reconciliation: {expected_reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_entitlements_marks_truncated_diagnostics_explicitly() {
+        let reconciled = reconcile_entitlements(
+            DerEntitlementObservation::Error {
+                reason: "🙂".repeat(MAX_RECONCILIATION_DIAGNOSTIC_BYTES),
+            },
+            LegacyEntitlementObservation::Absent,
+        );
+
+        let diagnostic = reconciled
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.contains("DER entitlement query"))
+            .expect("DER error must produce a diagnostic");
+        assert!(diagnostic.len() <= MAX_RECONCILIATION_DIAGNOSTIC_BYTES);
+        assert!(diagnostic.ends_with("[truncated]"));
+        assert!(diagnostic.is_char_boundary(diagnostic.len()));
     }
 }

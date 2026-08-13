@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use crate::macos::command::SystemCommandRunner;
 use crate::macos::command::{NativeCommandError, NativeCommandOutput, NativeCommandRunner};
-use crate::macos::entitlements::{EntitlementEntry, EntitlementSource};
+use crate::macos::entitlements::{EntitlementEntry, EntitlementSource, ReconciledEntitlements};
 use crate::macos::security_info::{
-    PreliminarySecurityObservation, SecurityInfoProvider, SelectedSecurityObservation,
-    SelectedSecurityRequest, UnavailableSecurityInfoProvider,
+    PreliminarySecurityObservation, SecurityInfoProvider, SecurityMetadata,
+    SelectedSecurityObservation, SelectedSecurityRequest, UnavailableSecurityInfoProvider,
 };
 use crate::scanner::result::{DiagnosticKind, ScanDiagnostic};
 
@@ -1884,6 +1884,945 @@ fn code_signature_diagnostic(target: &Path, message: String) -> ScanDiagnostic {
         Some(target.to_path_buf()),
         message,
     )
+}
+
+const MAX_RECONCILIATION_TEXT_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ArchitectureState {
+    #[cfg_attr(not(test), allow(dead_code))]
+    NoSafeSelector,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Single(CodeSignatureArchitecture),
+    #[cfg_attr(not(test), allow(dead_code))]
+    Selected {
+        selected: CodeSignatureArchitecture,
+        available: Vec<CodeSignatureArchitecture>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerificationAssessment {
+    pub(crate) status: NativeCheckStatus,
+    pub(crate) positive_signed: bool,
+    pub(crate) explicit_unsigned: bool,
+    pub(crate) detail: Option<String>,
+    pub(crate) diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectedSecurityAssessment {
+    pub(crate) metadata_status: NativeCheckStatus,
+    pub(crate) positive_signed: bool,
+    pub(crate) explicit_unsigned: bool,
+    pub(crate) metadata: Option<SecurityMetadata>,
+    pub(crate) diagnostics: Vec<String>,
+}
+
+struct BoundArchitecture {
+    scope: NativeFactScope,
+    selected: CodeSignatureArchitecture,
+    available: Vec<CodeSignatureArchitecture>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn reconcile_inspection(
+    target: &Path,
+    target_kind: CodeSignatureTargetKind,
+    architecture: ArchitectureState,
+    verification: VerificationAssessment,
+    security: SelectedSecurityAssessment,
+    entitlements: ReconciledEntitlements,
+) -> CodeSignatureInspection {
+    let VerificationAssessment {
+        status: verification_status,
+        positive_signed: verification_positive,
+        explicit_unsigned: verification_unsigned,
+        detail: verification_detail,
+        diagnostics: verification_diagnostics,
+    } = verification;
+    let SelectedSecurityAssessment {
+        metadata_status,
+        positive_signed: security_positive,
+        explicit_unsigned: security_unsigned,
+        metadata,
+        diagnostics: security_diagnostics,
+    } = security;
+    let ReconciledEntitlements {
+        der_entitlements_status,
+        entitlements_status,
+        entitlement_source,
+        entitlements,
+        positive_signed: entitlement_positive,
+        explicit_unsigned: entitlement_unsigned,
+        diagnostics: entitlement_diagnostics,
+    } = entitlements;
+
+    let mut diagnostic_messages = Vec::new();
+    for message in verification_diagnostics
+        .into_iter()
+        .chain(security_diagnostics)
+        .chain(entitlement_diagnostics)
+    {
+        push_bounded_reconciliation_text(&mut diagnostic_messages, &message);
+    }
+
+    let bound_architecture = normalize_architecture(architecture, &mut diagnostic_messages);
+    let (presence, native_fact_scope) = match &bound_architecture {
+        Some(bound) => {
+            let mut explicit_unsigned = security_unsigned || entitlement_unsigned;
+            if bound.scope == NativeFactScope::SingleArchitecture {
+                explicit_unsigned |= verification_unsigned;
+            } else if verification_unsigned {
+                push_bounded_reconciliation_text(
+                    &mut diagnostic_messages,
+                    "all-architecture unsigned result cannot be attributed to the selected architecture",
+                );
+            }
+
+            let positive_signed =
+                verification_positive || security_positive || entitlement_positive;
+            let presence = match (positive_signed, explicit_unsigned) {
+                (true, true) => {
+                    push_bounded_reconciliation_text(
+                        &mut diagnostic_messages,
+                        "code-signature observations disagree about selected-scope signature presence",
+                    );
+                    SignaturePresence::Unknown
+                }
+                (true, false) => SignaturePresence::Signed,
+                (false, true) => SignaturePresence::Unsigned,
+                (false, false) => SignaturePresence::Unknown,
+            };
+            (presence, bound.scope)
+        }
+        None if verification_positive && !verification_unsigned => {
+            (SignaturePresence::Signed, NativeFactScope::AllArchitectures)
+        }
+        None => (SignaturePresence::Unknown, NativeFactScope::Unknown),
+    };
+
+    let selector_is_bound = bound_architecture.is_some();
+    let (metadata_status, der_entitlements_status, entitlements_status) = if selector_is_bound {
+        (
+            metadata_status,
+            der_entitlements_status,
+            entitlements_status,
+        )
+    } else {
+        (
+            NativeCheckStatus::Error,
+            NativeCheckStatus::Error,
+            NativeCheckStatus::Error,
+        )
+    };
+
+    let retain_selected_facts = selector_is_bound && presence == SignaturePresence::Signed;
+    let retained_metadata = if retain_selected_facts && metadata_status == NativeCheckStatus::Passed
+    {
+        metadata
+    } else {
+        None
+    };
+    let (identifier, team_identifier, authorities, signature_kind, hardened_runtime) =
+        match retained_metadata {
+            Some(metadata) => {
+                let signature_kind = match (metadata.ad_hoc, metadata.authorities.is_empty()) {
+                    (true, true) => SignatureKind::AdHoc,
+                    (false, false) => SignatureKind::CertificateBacked,
+                    (true, false) => {
+                        push_bounded_reconciliation_text(
+                            &mut diagnostic_messages,
+                            "structured signing information contains conflicting ad-hoc and certificate-backed markers",
+                        );
+                        SignatureKind::Unknown
+                    }
+                    (false, true) => SignatureKind::Unknown,
+                };
+                (
+                    Some(metadata.identifier),
+                    metadata.team_identifier,
+                    metadata.authorities,
+                    signature_kind,
+                    Some(metadata.hardened_runtime),
+                )
+            }
+            None => (None, None, Vec::new(), SignatureKind::Unknown, None),
+        };
+
+    let (entitlement_source, entitlements) = if retain_selected_facts {
+        match entitlement_source {
+            Some(source) => (Some(source), entitlements),
+            None => (None, Vec::new()),
+        }
+    } else {
+        (None, Vec::new())
+    };
+
+    let (selected_architecture, available_architectures) = match bound_architecture {
+        Some(bound) => (Some(bound.selected), bound.available),
+        None => (None, Vec::new()),
+    };
+
+    diagnostic_messages.sort_unstable();
+    diagnostic_messages.dedup();
+    let diagnostics = diagnostic_messages
+        .into_iter()
+        .map(|message| code_signature_diagnostic(target, message))
+        .collect();
+
+    CodeSignatureInspection {
+        target: target.to_path_buf(),
+        target_kind,
+        native_fact_scope,
+        selected_architecture,
+        available_architectures,
+        presence,
+        verification_status,
+        metadata_status,
+        der_entitlements_status,
+        entitlements_status,
+        entitlement_source,
+        entitlements,
+        identifier,
+        team_identifier,
+        authorities,
+        signature_kind,
+        hardened_runtime,
+        verification_detail: verification_detail
+            .as_deref()
+            .map(bounded_reconciliation_text),
+        diagnostics,
+    }
+}
+
+fn normalize_architecture(
+    architecture: ArchitectureState,
+    diagnostics: &mut Vec<String>,
+) -> Option<BoundArchitecture> {
+    match architecture {
+        ArchitectureState::NoSafeSelector => None,
+        ArchitectureState::Single(selected) => Some(BoundArchitecture {
+            scope: NativeFactScope::SingleArchitecture,
+            available: vec![selected.clone()],
+            selected,
+        }),
+        ArchitectureState::Selected {
+            selected,
+            mut available,
+        } => {
+            available.sort();
+            let has_duplicate = available.windows(2).any(|pair| pair[0] == pair[1]);
+            let valid = (2..=32).contains(&available.len())
+                && !has_duplicate
+                && available.binary_search(&selected).is_ok();
+            if !valid {
+                push_bounded_reconciliation_text(
+                    diagnostics,
+                    "selected architecture state is invalid; selected facts were discarded",
+                );
+                return None;
+            }
+
+            let uninspected = available
+                .iter()
+                .filter(|architecture| **architecture != selected)
+                .map(CodeSignatureArchitecture::codesign_selector)
+                .collect::<Vec<_>>()
+                .join("; ");
+            push_bounded_reconciliation_text(
+                diagnostics,
+                &format!(
+                    "selected {}; uninspected architectures: {uninspected}",
+                    selected.codesign_selector()
+                ),
+            );
+            Some(BoundArchitecture {
+                scope: NativeFactScope::SelectedArchitecture,
+                selected,
+                available,
+            })
+        }
+    }
+}
+
+fn bounded_reconciliation_text(text: &str) -> String {
+    const TRUNCATED_SUFFIX: &str = "[truncated]";
+    if text.len() <= MAX_RECONCILIATION_TEXT_BYTES {
+        return text.to_owned();
+    }
+
+    let mut end = MAX_RECONCILIATION_TEXT_BYTES - TRUNCATED_SUFFIX.len();
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(MAX_RECONCILIATION_TEXT_BYTES);
+    bounded.push_str(&text[..end]);
+    bounded.push_str(TRUNCATED_SUFFIX);
+    bounded
+}
+
+fn push_bounded_reconciliation_text(diagnostics: &mut Vec<String>, message: &str) {
+    diagnostics.push(bounded_reconciliation_text(message));
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+    use crate::macos::entitlements::ReconciledEntitlements;
+    use crate::macos::security_info::SecurityMetadata;
+
+    fn architecture(cpu_type: i32, cpu_subtype: i32) -> CodeSignatureArchitecture {
+        CodeSignatureArchitecture::new(cpu_type, cpu_subtype)
+    }
+
+    fn verification(
+        status: NativeCheckStatus,
+        positive_signed: bool,
+        explicit_unsigned: bool,
+    ) -> VerificationAssessment {
+        VerificationAssessment {
+            status,
+            positive_signed,
+            explicit_unsigned,
+            detail: Some("all-architecture verification detail".to_string()),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn metadata(identifier: &str) -> SecurityMetadata {
+        SecurityMetadata {
+            identifier: identifier.to_string(),
+            team_identifier: Some("TEAM".to_string()),
+            authorities: vec!["Signer".to_string()],
+            ad_hoc: false,
+            hardened_runtime: true,
+        }
+    }
+
+    fn security(
+        status: NativeCheckStatus,
+        positive_signed: bool,
+        explicit_unsigned: bool,
+        facts: Option<SecurityMetadata>,
+    ) -> SelectedSecurityAssessment {
+        SelectedSecurityAssessment {
+            metadata_status: status,
+            positive_signed,
+            explicit_unsigned,
+            metadata: facts,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn entitlements(
+        der_status: NativeCheckStatus,
+        final_status: NativeCheckStatus,
+        positive_signed: bool,
+        explicit_unsigned: bool,
+        source: Option<EntitlementSource>,
+    ) -> ReconciledEntitlements {
+        let entries = source
+            .map(|_| {
+                vec![EntitlementEntry {
+                    key: "com.example.fact".to_string(),
+                    value: crate::macos::entitlements::EntitlementValue::Boolean(true),
+                }]
+            })
+            .unwrap_or_default();
+        ReconciledEntitlements {
+            der_entitlements_status: der_status,
+            entitlements_status: final_status,
+            entitlement_source: source,
+            entitlements: entries,
+            positive_signed,
+            explicit_unsigned,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn reconcile_case(
+        architecture: ArchitectureState,
+        verification: VerificationAssessment,
+        security: SelectedSecurityAssessment,
+        entitlements: ReconciledEntitlements,
+    ) -> CodeSignatureInspection {
+        reconcile_inspection(
+            Path::new("/tmp/target"),
+            CodeSignatureTargetKind::MachOFile,
+            architecture,
+            verification,
+            security,
+            entitlements,
+        )
+    }
+
+    fn messages(inspection: &CodeSignatureInspection) -> Vec<&str> {
+        inspection
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn single_architecture_reconciles_all_same_scope_presence_signals() {
+        let selected = architecture(7, 3);
+        let signed = reconcile_case(
+            ArchitectureState::Single(selected.clone()),
+            verification(NativeCheckStatus::Passed, true, false),
+            security(
+                NativeCheckStatus::Passed,
+                true,
+                false,
+                Some(metadata("signed")),
+            ),
+            entitlements(
+                NativeCheckStatus::Passed,
+                NativeCheckStatus::Passed,
+                true,
+                false,
+                Some(EntitlementSource::CodesignDerOutput),
+            ),
+        );
+        assert_eq!(signed.presence, SignaturePresence::Signed);
+        assert_eq!(
+            signed.native_fact_scope,
+            NativeFactScope::SingleArchitecture
+        );
+        assert_eq!(signed.selected_architecture, Some(selected.clone()));
+        assert_eq!(signed.available_architectures, vec![selected.clone()]);
+        assert_eq!(signed.identifier.as_deref(), Some("signed"));
+        assert_eq!(
+            signed.entitlement_source,
+            Some(EntitlementSource::CodesignDerOutput)
+        );
+
+        let unsigned = reconcile_case(
+            ArchitectureState::Single(selected.clone()),
+            verification(NativeCheckStatus::NotApplicable, false, true),
+            security(
+                NativeCheckStatus::NotApplicable,
+                false,
+                true,
+                Some(metadata("must-clear")),
+            ),
+            entitlements(
+                NativeCheckStatus::NotApplicable,
+                NativeCheckStatus::NotApplicable,
+                false,
+                true,
+                Some(EntitlementSource::CodesignDerOutput),
+            ),
+        );
+        assert_eq!(unsigned.presence, SignaturePresence::Unsigned);
+        assert_eq!(
+            unsigned.native_fact_scope,
+            NativeFactScope::SingleArchitecture
+        );
+        assert_eq!(unsigned.selected_architecture, Some(selected));
+        assert!(unsigned.identifier.is_none());
+        assert!(unsigned.authorities.is_empty());
+        assert!(unsigned.entitlements.is_empty());
+        assert!(unsigned.entitlement_source.is_none());
+    }
+
+    #[test]
+    fn every_single_architecture_query_can_independently_establish_presence() {
+        let neutral_verification = || verification(NativeCheckStatus::Failed, false, false);
+        let neutral_security = || security(NativeCheckStatus::Error, false, false, None);
+        let neutral_entitlements = || {
+            entitlements(
+                NativeCheckStatus::Error,
+                NativeCheckStatus::Error,
+                false,
+                false,
+                None,
+            )
+        };
+
+        let cases = [
+            (
+                verification(NativeCheckStatus::Passed, true, false),
+                neutral_security(),
+                neutral_entitlements(),
+                SignaturePresence::Signed,
+            ),
+            (
+                verification(NativeCheckStatus::NotApplicable, false, true),
+                neutral_security(),
+                neutral_entitlements(),
+                SignaturePresence::Unsigned,
+            ),
+            (
+                neutral_verification(),
+                security(NativeCheckStatus::Passed, true, false, None),
+                neutral_entitlements(),
+                SignaturePresence::Signed,
+            ),
+            (
+                neutral_verification(),
+                security(NativeCheckStatus::NotApplicable, false, true, None),
+                neutral_entitlements(),
+                SignaturePresence::Unsigned,
+            ),
+            (
+                neutral_verification(),
+                neutral_security(),
+                entitlements(
+                    NativeCheckStatus::Passed,
+                    NativeCheckStatus::Passed,
+                    true,
+                    false,
+                    Some(EntitlementSource::CodesignDerOutput),
+                ),
+                SignaturePresence::Signed,
+            ),
+            (
+                neutral_verification(),
+                neutral_security(),
+                entitlements(
+                    NativeCheckStatus::NotApplicable,
+                    NativeCheckStatus::NotApplicable,
+                    false,
+                    true,
+                    None,
+                ),
+                SignaturePresence::Unsigned,
+            ),
+        ];
+
+        for (verification, security, entitlements, expected) in cases {
+            let inspection = reconcile_case(
+                ArchitectureState::Single(architecture(7, 3)),
+                verification,
+                security,
+                entitlements,
+            );
+            assert_eq!(inspection.presence, expected);
+            assert_eq!(
+                inspection.native_fact_scope,
+                NativeFactScope::SingleArchitecture
+            );
+        }
+    }
+
+    #[test]
+    fn same_scope_contradiction_clears_facts_without_rewriting_statuses() {
+        let inspection = reconcile_case(
+            ArchitectureState::Single(architecture(7, 3)),
+            verification(NativeCheckStatus::Passed, true, false),
+            security(
+                NativeCheckStatus::Passed,
+                true,
+                false,
+                Some(metadata("must-clear")),
+            ),
+            entitlements(
+                NativeCheckStatus::NotApplicable,
+                NativeCheckStatus::Error,
+                false,
+                true,
+                Some(EntitlementSource::LegacyPropertyListNonAuthoritative),
+            ),
+        );
+
+        assert_eq!(inspection.presence, SignaturePresence::Unknown);
+        assert_eq!(inspection.verification_status, NativeCheckStatus::Passed);
+        assert_eq!(inspection.metadata_status, NativeCheckStatus::Passed);
+        assert_eq!(
+            inspection.der_entitlements_status,
+            NativeCheckStatus::NotApplicable
+        );
+        assert_eq!(inspection.entitlements_status, NativeCheckStatus::Error);
+        assert!(inspection.identifier.is_none());
+        assert!(inspection.team_identifier.is_none());
+        assert!(inspection.authorities.is_empty());
+        assert_eq!(inspection.signature_kind, SignatureKind::Unknown);
+        assert!(inspection.hardened_runtime.is_none());
+        assert!(inspection.entitlements.is_empty());
+        assert!(inspection.entitlement_source.is_none());
+        assert_eq!(
+            messages(&inspection)
+                .iter()
+                .filter(|message| {
+                    **message
+                        == "code-signature observations disagree about selected-scope signature presence"
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn selected_architecture_does_not_treat_all_arch_unsigned_as_selected_unsigned() {
+        let first = architecture(7, 3);
+        let selected = architecture(12, 0);
+        let last = architecture(0x0100_000c, 2);
+        let inspection = reconcile_case(
+            ArchitectureState::Selected {
+                selected: selected.clone(),
+                available: vec![last.clone(), selected.clone(), first.clone()],
+            },
+            verification(NativeCheckStatus::NotApplicable, false, true),
+            security(
+                NativeCheckStatus::Passed,
+                true,
+                false,
+                Some(metadata("selected-signed")),
+            ),
+            entitlements(
+                NativeCheckStatus::Passed,
+                NativeCheckStatus::Passed,
+                true,
+                false,
+                Some(EntitlementSource::CodesignDerOutput),
+            ),
+        );
+
+        assert_eq!(inspection.presence, SignaturePresence::Signed);
+        assert_eq!(
+            inspection.native_fact_scope,
+            NativeFactScope::SelectedArchitecture
+        );
+        assert_eq!(inspection.selected_architecture, Some(selected));
+        assert_eq!(
+            inspection.available_architectures,
+            vec![first, architecture(12, 0), last]
+        );
+        assert!(messages(&inspection).contains(
+            &"all-architecture unsigned result cannot be attributed to the selected architecture"
+        ));
+        assert!(
+            !messages(&inspection)
+                .iter()
+                .any(|message| message.contains("disagree about selected-scope"))
+        );
+    }
+
+    #[test]
+    fn selected_unsigned_survives_failed_verification_but_passed_verification_contradicts_it() {
+        let state = ArchitectureState::Selected {
+            selected: architecture(7, 3),
+            available: vec![architecture(7, 3), architecture(12, 0)],
+        };
+        let selected_unsigned = security(
+            NativeCheckStatus::NotApplicable,
+            false,
+            true,
+            Some(metadata("must-clear")),
+        );
+        let no_entitlements = entitlements(
+            NativeCheckStatus::NotApplicable,
+            NativeCheckStatus::NotApplicable,
+            false,
+            true,
+            None,
+        );
+
+        let unsigned = reconcile_case(
+            state.clone(),
+            verification(NativeCheckStatus::Failed, false, false),
+            selected_unsigned.clone(),
+            no_entitlements.clone(),
+        );
+        assert_eq!(unsigned.presence, SignaturePresence::Unsigned);
+
+        let contradictory = reconcile_case(
+            state,
+            verification(NativeCheckStatus::Passed, true, false),
+            selected_unsigned,
+            no_entitlements,
+        );
+        assert_eq!(contradictory.presence, SignaturePresence::Unknown);
+    }
+
+    #[test]
+    fn no_safe_selector_allows_only_successful_verification_to_establish_presence() {
+        let compatibility = entitlements(
+            NativeCheckStatus::Failed,
+            NativeCheckStatus::Error,
+            false,
+            false,
+            Some(EntitlementSource::LegacyPropertyListNonAuthoritative),
+        );
+        let verification_signed = reconcile_case(
+            ArchitectureState::NoSafeSelector,
+            verification(NativeCheckStatus::Passed, true, false),
+            security(
+                NativeCheckStatus::Passed,
+                true,
+                false,
+                Some(metadata("must-clear")),
+            ),
+            compatibility.clone(),
+        );
+        assert_eq!(verification_signed.presence, SignaturePresence::Signed);
+        assert_eq!(
+            verification_signed.native_fact_scope,
+            NativeFactScope::AllArchitectures
+        );
+        assert_eq!(
+            verification_signed.verification_status,
+            NativeCheckStatus::Passed
+        );
+        assert_eq!(
+            verification_signed.metadata_status,
+            NativeCheckStatus::Error
+        );
+        assert_eq!(
+            verification_signed.der_entitlements_status,
+            NativeCheckStatus::Error
+        );
+        assert_eq!(
+            verification_signed.entitlements_status,
+            NativeCheckStatus::Error
+        );
+        assert!(verification_signed.selected_architecture.is_none());
+        assert!(verification_signed.available_architectures.is_empty());
+        assert!(verification_signed.identifier.is_none());
+        assert!(verification_signed.entitlements.is_empty());
+
+        let unattributable_unsigned = reconcile_case(
+            ArchitectureState::NoSafeSelector,
+            verification(NativeCheckStatus::NotApplicable, false, true),
+            security(
+                NativeCheckStatus::NotApplicable,
+                false,
+                true,
+                Some(metadata("must-clear")),
+            ),
+            compatibility,
+        );
+        assert_eq!(unattributable_unsigned.presence, SignaturePresence::Unknown);
+        assert_eq!(
+            unattributable_unsigned.native_fact_scope,
+            NativeFactScope::Unknown
+        );
+
+        for status in [
+            NativeCheckStatus::Failed,
+            NativeCheckStatus::Unavailable,
+            NativeCheckStatus::Error,
+        ] {
+            let inspection = reconcile_case(
+                ArchitectureState::NoSafeSelector,
+                verification(status, false, false),
+                security(
+                    NativeCheckStatus::Passed,
+                    true,
+                    false,
+                    Some(metadata("ignored")),
+                ),
+                entitlements(
+                    NativeCheckStatus::Passed,
+                    NativeCheckStatus::Passed,
+                    true,
+                    false,
+                    Some(EntitlementSource::CodesignDerOutput),
+                ),
+            );
+            assert_eq!(inspection.presence, SignaturePresence::Unknown);
+            assert_eq!(inspection.native_fact_scope, NativeFactScope::Unknown);
+            assert!(inspection.selected_architecture.is_none());
+            assert!(inspection.available_architectures.is_empty());
+            assert!(inspection.identifier.is_none());
+            assert!(inspection.entitlements.is_empty());
+        }
+    }
+
+    #[test]
+    fn compatibility_facts_require_an_uncontradicted_same_scope_positive_observation() {
+        let state = ArchitectureState::Single(architecture(7, 3));
+        let compatibility = entitlements(
+            NativeCheckStatus::Unavailable,
+            NativeCheckStatus::Error,
+            false,
+            false,
+            Some(EntitlementSource::LegacyPropertyListNonAuthoritative),
+        );
+        let retained = reconcile_case(
+            state.clone(),
+            verification(NativeCheckStatus::Passed, true, false),
+            security(NativeCheckStatus::Error, false, false, None),
+            compatibility.clone(),
+        );
+        assert_eq!(retained.presence, SignaturePresence::Signed);
+        assert_eq!(retained.entitlements.len(), 1);
+        assert_eq!(
+            retained.entitlement_source,
+            Some(EntitlementSource::LegacyPropertyListNonAuthoritative)
+        );
+
+        let cleared = reconcile_case(
+            state,
+            verification(NativeCheckStatus::Failed, false, false),
+            security(NativeCheckStatus::Error, false, false, None),
+            compatibility,
+        );
+        assert_eq!(cleared.presence, SignaturePresence::Unknown);
+        assert!(cleared.entitlements.is_empty());
+        assert!(cleared.entitlement_source.is_none());
+        assert_eq!(cleared.entitlements_status, NativeCheckStatus::Error);
+    }
+
+    #[test]
+    fn universal_coverage_diagnostic_is_exact_sorted_bounded_and_selection_dependent() {
+        let state = ArchitectureState::Selected {
+            selected: architecture(12, 0),
+            available: vec![
+                architecture(0x0100_000c, 2),
+                architecture(12, 0),
+                architecture(7, 3),
+            ],
+        };
+        let inspection = reconcile_case(
+            state,
+            verification(NativeCheckStatus::Failed, false, false),
+            security(NativeCheckStatus::Error, false, false, None),
+            entitlements(
+                NativeCheckStatus::Error,
+                NativeCheckStatus::Error,
+                false,
+                false,
+                None,
+            ),
+        );
+        let coverage = messages(&inspection)
+            .into_iter()
+            .filter(|message| message.contains("uninspected architectures"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            coverage,
+            vec!["selected 12,0; uninspected architectures: 7,3; 16777228,2"]
+        );
+        assert!(coverage[0].len() <= 4 * 1024);
+
+        let unbound = reconcile_case(
+            ArchitectureState::NoSafeSelector,
+            verification(NativeCheckStatus::Failed, false, false),
+            security(NativeCheckStatus::Error, false, false, None),
+            entitlements(
+                NativeCheckStatus::Error,
+                NativeCheckStatus::Error,
+                false,
+                false,
+                None,
+            ),
+        );
+        assert!(
+            !messages(&unbound)
+                .iter()
+                .any(|message| message.contains("uninspected architectures"))
+        );
+    }
+
+    #[test]
+    fn reconciliation_diagnostics_are_bounded_sorted_and_deduplicated() {
+        let oversized = "🙂".repeat(4 * 1024);
+        let mut verification = verification(NativeCheckStatus::Failed, false, false);
+        verification.diagnostics = vec![oversized.clone(), "same".to_string()];
+        let mut security = security(NativeCheckStatus::Error, false, false, None);
+        security.diagnostics = vec!["same".to_string()];
+        let mut reconciled = entitlements(
+            NativeCheckStatus::Error,
+            NativeCheckStatus::Error,
+            false,
+            false,
+            None,
+        );
+        reconciled.diagnostics = vec!["z-last".to_string()];
+
+        let inspection = reconcile_case(
+            ArchitectureState::Single(architecture(7, 3)),
+            verification,
+            security,
+            reconciled,
+        );
+        let messages = messages(&inspection);
+        assert!(messages.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(messages.iter().all(|message| message.len() <= 4 * 1024));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| **message == "same")
+                .count(),
+            1
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.ends_with("[truncated]"))
+        );
+    }
+
+    #[test]
+    fn verification_detail_is_utf8_safely_bounded_with_an_explicit_marker() {
+        let mut verification = verification(NativeCheckStatus::Failed, false, false);
+        verification.detail = Some("🙂".repeat(4 * 1024));
+
+        let inspection = reconcile_case(
+            ArchitectureState::Single(architecture(7, 3)),
+            verification,
+            security(NativeCheckStatus::Error, false, false, None),
+            entitlements(
+                NativeCheckStatus::Error,
+                NativeCheckStatus::Error,
+                false,
+                false,
+                None,
+            ),
+        );
+
+        let detail = inspection
+            .verification_detail
+            .expect("verification detail should remain available");
+        assert!(detail.len() <= 4 * 1024);
+        assert!(detail.ends_with("[truncated]"));
+        assert!(detail.is_char_boundary(detail.len()));
+    }
+
+    #[test]
+    fn malformed_selected_architecture_state_falls_back_to_verification_only_scope() {
+        let inspection = reconcile_case(
+            ArchitectureState::Selected {
+                selected: architecture(12, 0),
+                available: vec![architecture(7, 3)],
+            },
+            verification(NativeCheckStatus::Passed, true, false),
+            security(
+                NativeCheckStatus::Passed,
+                true,
+                false,
+                Some(metadata("must-clear")),
+            ),
+            entitlements(
+                NativeCheckStatus::Passed,
+                NativeCheckStatus::Passed,
+                true,
+                false,
+                Some(EntitlementSource::CodesignDerOutput),
+            ),
+        );
+
+        assert_eq!(inspection.presence, SignaturePresence::Signed);
+        assert_eq!(
+            inspection.native_fact_scope,
+            NativeFactScope::AllArchitectures
+        );
+        assert_eq!(inspection.verification_status, NativeCheckStatus::Passed);
+        assert_eq!(inspection.metadata_status, NativeCheckStatus::Error);
+        assert_eq!(inspection.der_entitlements_status, NativeCheckStatus::Error);
+        assert_eq!(inspection.entitlements_status, NativeCheckStatus::Error);
+        assert!(inspection.selected_architecture.is_none());
+        assert!(inspection.available_architectures.is_empty());
+        assert!(inspection.identifier.is_none());
+        assert!(inspection.entitlements.is_empty());
+        assert!(
+            messages(&inspection)
+                .contains(&"selected architecture state is invalid; selected facts were discarded")
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
