@@ -29,6 +29,28 @@ pub enum EntitlementValue {
     Dictionary(Vec<EntitlementEntry>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyFormat {
+    Xml,
+    Binary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum LegacyEntitlementObservation {
+    Absent,
+    Valid {
+        format: LegacyFormat,
+        entries: Vec<EntitlementEntry>,
+    },
+    Invalid {
+        reason: String,
+    },
+    Unobserved {
+        reason: String,
+    },
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntitlementSource {
@@ -88,6 +110,10 @@ impl EntitlementBudget {
         Ok(())
     }
 
+    pub(crate) fn remaining_materialized_bytes(&self) -> usize {
+        MAX_ENTITLEMENT_MATERIALIZED_BYTES.saturating_sub(self.materialized_bytes)
+    }
+
     fn enter_node(&mut self) -> Result<(), String> {
         let nodes = self
             .nodes
@@ -101,6 +127,217 @@ impl EntitlementBudget {
 
         self.nodes = nodes;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum StructuredValueKind {
+    Boolean,
+    Integer,
+    String,
+    Data,
+    Array,
+    Dictionary,
+    Unsupported,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) trait StructuredEntitlementReader {
+    type Value: Copy;
+
+    fn identity(&self, value: Self::Value) -> usize;
+    fn kind(&self, value: Self::Value) -> Result<StructuredValueKind, String>;
+    fn read_boolean(&self, value: Self::Value) -> Result<bool, String>;
+    fn read_integer(&self, value: Self::Value) -> Result<i64, String>;
+    fn read_string(&self, value: Self::Value, max_bytes: usize) -> Result<String, String>;
+    fn read_data(&self, value: Self::Value, max_bytes: usize) -> Result<Vec<u8>, String>;
+    fn array_len(&self, value: Self::Value) -> Result<usize, String>;
+    fn array_value(&self, value: Self::Value, index: usize) -> Result<Self::Value, String>;
+    fn dictionary_len(&self, value: Self::Value) -> Result<usize, String>;
+    fn dictionary_entry(
+        &self,
+        value: Self::Value,
+        index: usize,
+    ) -> Result<(Self::Value, Self::Value), String>;
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decode_structured_entitlements<R: StructuredEntitlementReader>(
+    reader: &R,
+    root: R::Value,
+) -> Result<Vec<EntitlementEntry>, String> {
+    let mut budget = EntitlementBudget::new();
+    budget.enter_value(1)?;
+    if reader.kind(root)? != StructuredValueKind::Dictionary {
+        return Err("structured entitlement root is not a dictionary".to_string());
+    }
+
+    let mut active_containers = std::collections::BTreeSet::new();
+    decode_structured_dictionary(reader, root, 1, &mut budget, &mut active_containers)
+}
+
+fn decode_structured_dictionary<R: StructuredEntitlementReader>(
+    reader: &R,
+    dictionary: R::Value,
+    depth: usize,
+    budget: &mut EntitlementBudget,
+    active_containers: &mut std::collections::BTreeSet<usize>,
+) -> Result<Vec<EntitlementEntry>, String> {
+    let identity = reader.identity(dictionary);
+    if !active_containers.insert(identity) {
+        return Err("structured entitlement containers contain a cycle".to_string());
+    }
+
+    let result = (|| {
+        let count = reader.dictionary_len(dictionary)?;
+        let mut entries = BTreeMap::new();
+        for index in 0..count {
+            budget.enter_dictionary_entry()?;
+            let (key_value, value) = reader.dictionary_entry(dictionary, index)?;
+            if reader.kind(key_value)? != StructuredValueKind::String {
+                return Err("structured entitlement dictionary key is not a string".to_string());
+            }
+            let key = reader.read_string(key_value, budget.remaining_materialized_bytes())?;
+            budget.charge_materialized(key.len())?;
+
+            let vacant = match entries.entry(key) {
+                std::collections::btree_map::Entry::Vacant(vacant) => vacant,
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(
+                        "structured entitlement dictionary contains a duplicate key".to_string()
+                    );
+                }
+            };
+            let child_depth = depth
+                .checked_add(1)
+                .ok_or_else(|| "structured entitlement depth counter overflowed".to_string())?;
+            let decoded =
+                decode_structured_value(reader, value, child_depth, budget, active_containers)?;
+            vacant.insert(decoded);
+        }
+
+        Ok(entries
+            .into_iter()
+            .map(|(key, value)| EntitlementEntry { key, value })
+            .collect())
+    })();
+    active_containers.remove(&identity);
+    result
+}
+
+fn decode_structured_value<R: StructuredEntitlementReader>(
+    reader: &R,
+    value: R::Value,
+    depth: usize,
+    budget: &mut EntitlementBudget,
+    active_containers: &mut std::collections::BTreeSet<usize>,
+) -> Result<EntitlementValue, String> {
+    budget.enter_value(depth)?;
+    match reader.kind(value)? {
+        StructuredValueKind::Boolean => {
+            let decoded = reader.read_boolean(value)?;
+            budget.charge_materialized(1)?;
+            Ok(EntitlementValue::Boolean(decoded))
+        }
+        StructuredValueKind::Integer => {
+            let decoded = reader.read_integer(value)?;
+            budget.charge_materialized(8)?;
+            Ok(EntitlementValue::SignedInteger(decoded))
+        }
+        StructuredValueKind::String => {
+            let decoded = reader.read_string(value, budget.remaining_materialized_bytes())?;
+            budget.charge_materialized(decoded.len())?;
+            Ok(EntitlementValue::String(decoded))
+        }
+        StructuredValueKind::Data => {
+            let decoded = reader.read_data(value, budget.remaining_materialized_bytes())?;
+            budget.charge_materialized(decoded.len())?;
+            Ok(EntitlementValue::Data(decoded))
+        }
+        StructuredValueKind::Array => {
+            decode_structured_array(reader, value, depth, budget, active_containers)
+        }
+        StructuredValueKind::Dictionary => {
+            decode_structured_dictionary(reader, value, depth, budget, active_containers)
+                .map(EntitlementValue::Dictionary)
+        }
+        StructuredValueKind::Unsupported => {
+            Err("structured entitlement value uses an unsupported type".to_string())
+        }
+    }
+}
+
+fn decode_structured_array<R: StructuredEntitlementReader>(
+    reader: &R,
+    array: R::Value,
+    depth: usize,
+    budget: &mut EntitlementBudget,
+    active_containers: &mut std::collections::BTreeSet<usize>,
+) -> Result<EntitlementValue, String> {
+    let identity = reader.identity(array);
+    if !active_containers.insert(identity) {
+        return Err("structured entitlement containers contain a cycle".to_string());
+    }
+
+    let result = (|| {
+        let count = reader.array_len(array)?;
+        let mut values = Vec::new();
+        for index in 0..count {
+            let value = reader.array_value(array, index)?;
+            let child_depth = depth
+                .checked_add(1)
+                .ok_or_else(|| "structured entitlement depth counter overflowed".to_string())?;
+            values.push(decode_structured_value(
+                reader,
+                value,
+                child_depth,
+                budget,
+                active_containers,
+            )?);
+        }
+        Ok(EntitlementValue::Array(values))
+    })();
+    active_containers.remove(&identity);
+    result
+}
+
+pub(crate) fn classify_legacy_entitlement_blob(bytes: &[u8]) -> Result<LegacyFormat, String> {
+    const BLOB_HEADER_BYTES: usize = 8;
+    const ENTITLEMENT_BLOB_MAGIC: [u8; 4] = [0xfa, 0xde, 0x71, 0x71];
+    const UTF8_BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
+
+    if bytes.len() > MAX_ENTITLEMENT_BYTES {
+        return Err(format!(
+            "legacy entitlement blob exceeds {MAX_ENTITLEMENT_BYTES} bytes"
+        ));
+    }
+    let header = bytes
+        .get(..BLOB_HEADER_BYTES)
+        .ok_or_else(|| "legacy entitlement blob is shorter than its header".to_string())?;
+    if header[..4] != ENTITLEMENT_BLOB_MAGIC {
+        return Err("legacy entitlement blob has the wrong magic".to_string());
+    }
+    let declared_length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    let declared_length = usize::try_from(declared_length)
+        .map_err(|_| "legacy entitlement blob length is not representable".to_string())?;
+    if declared_length != bytes.len() {
+        return Err("legacy entitlement blob length does not match its bytes".to_string());
+    }
+
+    let payload = &bytes[BLOB_HEADER_BYTES..];
+    if payload.starts_with(b"bplist00") {
+        return Ok(LegacyFormat::Binary);
+    }
+
+    let payload = payload.strip_prefix(&UTF8_BOM).unwrap_or(payload);
+    let xml = std::str::from_utf8(payload)
+        .map_err(|_| "legacy XML entitlement payload is not valid UTF-8".to_string())?;
+    let xml = xml.trim_start_matches([' ', '\t', '\r', '\n']);
+    if xml.starts_with("<?xml") || xml.starts_with("<plist") {
+        Ok(LegacyFormat::Xml)
+    } else {
+        Err("legacy entitlement payload has an unsupported format".to_string())
     }
 }
 
@@ -297,6 +534,446 @@ fn decode_der_array(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum FakeValue<'a> {
+        Boolean(bool),
+        Integer(i64),
+        InvalidInteger,
+        String(&'a str),
+        Data(&'a [u8]),
+        Array(&'a [FakeValue<'a>]),
+        Dictionary(&'a [(FakeValue<'a>, FakeValue<'a>)]),
+        Unsupported,
+    }
+
+    struct FakeStructuredReader<'a>(std::marker::PhantomData<&'a ()>);
+
+    impl<'a> StructuredEntitlementReader for FakeStructuredReader<'a> {
+        type Value = FakeValue<'a>;
+
+        fn identity(&self, value: Self::Value) -> usize {
+            match value {
+                FakeValue::Array(values) => values.as_ptr() as usize,
+                FakeValue::Dictionary(entries) => entries.as_ptr() as usize,
+                FakeValue::String(value) => value.as_ptr() as usize,
+                FakeValue::Data(value) => value.as_ptr() as usize,
+                FakeValue::Boolean(value) => usize::from(value),
+                FakeValue::Integer(value) => value as usize,
+                FakeValue::InvalidInteger => usize::MAX - 1,
+                FakeValue::Unsupported => usize::MAX,
+            }
+        }
+
+        fn kind(&self, value: Self::Value) -> Result<StructuredValueKind, String> {
+            Ok(match value {
+                FakeValue::Boolean(_) => StructuredValueKind::Boolean,
+                FakeValue::Integer(_) => StructuredValueKind::Integer,
+                FakeValue::InvalidInteger => StructuredValueKind::Integer,
+                FakeValue::String(_) => StructuredValueKind::String,
+                FakeValue::Data(_) => StructuredValueKind::Data,
+                FakeValue::Array(_) => StructuredValueKind::Array,
+                FakeValue::Dictionary(_) => StructuredValueKind::Dictionary,
+                FakeValue::Unsupported => StructuredValueKind::Unsupported,
+            })
+        }
+
+        fn read_boolean(&self, value: Self::Value) -> Result<bool, String> {
+            match value {
+                FakeValue::Boolean(value) => Ok(value),
+                _ => Err("not a Boolean".to_string()),
+            }
+        }
+
+        fn read_integer(&self, value: Self::Value) -> Result<i64, String> {
+            match value {
+                FakeValue::Integer(value) => Ok(value),
+                FakeValue::InvalidInteger => Err("integer conversion failed".to_string()),
+                _ => Err("not an integer".to_string()),
+            }
+        }
+
+        fn read_string(&self, value: Self::Value, max_bytes: usize) -> Result<String, String> {
+            match value {
+                FakeValue::String(value) if value.len() <= max_bytes => Ok(value.to_string()),
+                FakeValue::String(_) => Err("string exceeds bound".to_string()),
+                _ => Err("not a string".to_string()),
+            }
+        }
+
+        fn read_data(&self, value: Self::Value, max_bytes: usize) -> Result<Vec<u8>, String> {
+            match value {
+                FakeValue::Data(value) if value.len() <= max_bytes => Ok(value.to_vec()),
+                FakeValue::Data(_) => Err("data exceeds bound".to_string()),
+                _ => Err("not data".to_string()),
+            }
+        }
+
+        fn array_len(&self, value: Self::Value) -> Result<usize, String> {
+            match value {
+                FakeValue::Array(values) => Ok(values.len()),
+                _ => Err("not an array".to_string()),
+            }
+        }
+
+        fn array_value(&self, value: Self::Value, index: usize) -> Result<Self::Value, String> {
+            match value {
+                FakeValue::Array(values) => values
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| "array index is out of range".to_string()),
+                _ => Err("not an array".to_string()),
+            }
+        }
+
+        fn dictionary_len(&self, value: Self::Value) -> Result<usize, String> {
+            match value {
+                FakeValue::Dictionary(entries) => Ok(entries.len()),
+                _ => Err("not a dictionary".to_string()),
+            }
+        }
+
+        fn dictionary_entry(
+            &self,
+            value: Self::Value,
+            index: usize,
+        ) -> Result<(Self::Value, Self::Value), String> {
+            match value {
+                FakeValue::Dictionary(entries) => entries
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| "dictionary index is out of range".to_string()),
+                _ => Err("not a dictionary".to_string()),
+            }
+        }
+    }
+
+    #[test]
+    fn structured_conversion_sorts_keys_and_preserves_array_order() {
+        let array = [FakeValue::Integer(2), FakeValue::Integer(1)];
+        let root = [
+            (FakeValue::String("z"), FakeValue::Array(&array)),
+            (FakeValue::String("a"), FakeValue::Boolean(true)),
+            (FakeValue::String("data"), FakeValue::Data(&[1, 2, 3])),
+        ];
+
+        assert_eq!(
+            decode_structured_entitlements(
+                &FakeStructuredReader(std::marker::PhantomData),
+                FakeValue::Dictionary(&root)
+            ),
+            Ok(vec![
+                EntitlementEntry {
+                    key: "a".to_string(),
+                    value: EntitlementValue::Boolean(true),
+                },
+                EntitlementEntry {
+                    key: "data".to_string(),
+                    value: EntitlementValue::Data(vec![1, 2, 3]),
+                },
+                EntitlementEntry {
+                    key: "z".to_string(),
+                    value: EntitlementValue::Array(vec![
+                        EntitlementValue::SignedInteger(2),
+                        EntitlementValue::SignedInteger(1),
+                    ]),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn structured_conversion_rejects_duplicates_unsupported_values_and_non_dictionary_root() {
+        let duplicate = [
+            (FakeValue::String("same"), FakeValue::Boolean(true)),
+            (FakeValue::String("same"), FakeValue::Boolean(false)),
+        ];
+        assert!(
+            decode_structured_entitlements(
+                &FakeStructuredReader(std::marker::PhantomData),
+                FakeValue::Dictionary(&duplicate)
+            )
+            .is_err()
+        );
+
+        let unsupported = [(FakeValue::String("bad"), FakeValue::Unsupported)];
+        assert!(
+            decode_structured_entitlements(
+                &FakeStructuredReader(std::marker::PhantomData),
+                FakeValue::Dictionary(&unsupported)
+            )
+            .is_err()
+        );
+        assert!(
+            decode_structured_entitlements(
+                &FakeStructuredReader(std::marker::PhantomData),
+                FakeValue::Boolean(true)
+            )
+            .is_err()
+        );
+
+        let invalid_integer = [(FakeValue::String("integer"), FakeValue::InvalidInteger)];
+        assert!(
+            decode_structured_entitlements(
+                &FakeStructuredReader(std::marker::PhantomData),
+                FakeValue::Dictionary(&invalid_integer)
+            )
+            .is_err()
+        );
+    }
+
+    enum GraphNode {
+        Boolean(bool),
+        String(String),
+        Array(Vec<usize>),
+        Dictionary(Vec<(usize, usize)>),
+    }
+
+    struct GraphStructuredReader {
+        nodes: Vec<GraphNode>,
+    }
+
+    impl StructuredEntitlementReader for GraphStructuredReader {
+        type Value = usize;
+
+        fn identity(&self, value: Self::Value) -> usize {
+            value
+        }
+
+        fn kind(&self, value: Self::Value) -> Result<StructuredValueKind, String> {
+            self.nodes
+                .get(value)
+                .map(|node| match node {
+                    GraphNode::Boolean(_) => StructuredValueKind::Boolean,
+                    GraphNode::String(_) => StructuredValueKind::String,
+                    GraphNode::Array(_) => StructuredValueKind::Array,
+                    GraphNode::Dictionary(_) => StructuredValueKind::Dictionary,
+                })
+                .ok_or_else(|| "unknown graph node".to_string())
+        }
+
+        fn read_boolean(&self, value: Self::Value) -> Result<bool, String> {
+            match self.nodes.get(value) {
+                Some(GraphNode::Boolean(value)) => Ok(*value),
+                _ => Err("not a Boolean".to_string()),
+            }
+        }
+
+        fn read_integer(&self, _value: Self::Value) -> Result<i64, String> {
+            Err("not an integer".to_string())
+        }
+
+        fn read_string(&self, value: Self::Value, max_bytes: usize) -> Result<String, String> {
+            match self.nodes.get(value) {
+                Some(GraphNode::String(value)) if value.len() <= max_bytes => Ok(value.clone()),
+                Some(GraphNode::String(_)) => Err("string exceeds bound".to_string()),
+                _ => Err("not a string".to_string()),
+            }
+        }
+
+        fn read_data(&self, _value: Self::Value, _max_bytes: usize) -> Result<Vec<u8>, String> {
+            Err("not data".to_string())
+        }
+
+        fn array_len(&self, value: Self::Value) -> Result<usize, String> {
+            match self.nodes.get(value) {
+                Some(GraphNode::Array(values)) => Ok(values.len()),
+                _ => Err("not an array".to_string()),
+            }
+        }
+
+        fn array_value(&self, value: Self::Value, index: usize) -> Result<Self::Value, String> {
+            match self.nodes.get(value) {
+                Some(GraphNode::Array(values)) => values
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| "array index is out of range".to_string()),
+                _ => Err("not an array".to_string()),
+            }
+        }
+
+        fn dictionary_len(&self, value: Self::Value) -> Result<usize, String> {
+            match self.nodes.get(value) {
+                Some(GraphNode::Dictionary(entries)) => Ok(entries.len()),
+                _ => Err("not a dictionary".to_string()),
+            }
+        }
+
+        fn dictionary_entry(
+            &self,
+            value: Self::Value,
+            index: usize,
+        ) -> Result<(Self::Value, Self::Value), String> {
+            match self.nodes.get(value) {
+                Some(GraphNode::Dictionary(entries)) => entries
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| "dictionary index is out of range".to_string()),
+                _ => Err("not a dictionary".to_string()),
+            }
+        }
+    }
+
+    #[test]
+    fn structured_conversion_rejects_active_cycles_and_excessive_depth() {
+        let cyclic = GraphStructuredReader {
+            nodes: vec![
+                GraphNode::Dictionary(vec![(1, 0)]),
+                GraphNode::String("cycle".to_string()),
+            ],
+        };
+        assert!(decode_structured_entitlements(&cyclic, 0).is_err());
+
+        let mut nodes = vec![
+            GraphNode::Dictionary(vec![(1, 2)]),
+            GraphNode::String("deep".to_string()),
+        ];
+        for index in 2..=32 {
+            nodes.push(GraphNode::Array(vec![index + 1]));
+        }
+        nodes.push(GraphNode::Boolean(true));
+        assert!(decode_structured_entitlements(&GraphStructuredReader { nodes }, 0).is_err());
+    }
+
+    #[test]
+    fn structured_conversion_charges_shared_values_per_occurrence_and_caps_nodes() {
+        let oversized_shared = "x".repeat(MAX_ENTITLEMENT_MATERIALIZED_BYTES / 2 + 1);
+        let shared = GraphStructuredReader {
+            nodes: vec![
+                GraphNode::Dictionary(vec![(1, 2), (3, 2)]),
+                GraphNode::String("first".to_string()),
+                GraphNode::String(oversized_shared),
+                GraphNode::String("second".to_string()),
+            ],
+        };
+        assert!(decode_structured_entitlements(&shared, 0).is_err());
+
+        let values = vec![2; MAX_ENTITLEMENT_NODES];
+        let excessive_nodes = GraphStructuredReader {
+            nodes: vec![
+                GraphNode::Dictionary(vec![(1, 3)]),
+                GraphNode::String("values".to_string()),
+                GraphNode::Boolean(true),
+                GraphNode::Array(values),
+            ],
+        };
+        assert!(decode_structured_entitlements(&excessive_nodes, 0).is_err());
+    }
+
+    #[test]
+    fn structured_conversion_handles_many_common_prefix_keys_in_sorted_order() {
+        let mut nodes = vec![GraphNode::Dictionary(Vec::new())];
+        let mut entries = Vec::new();
+        for index in (0..1_500).rev() {
+            let key = nodes.len();
+            nodes.push(GraphNode::String(format!("common.prefix.{index:04}")));
+            let value = nodes.len();
+            nodes.push(GraphNode::Boolean(index % 2 == 0));
+            entries.push((key, value));
+        }
+        nodes[0] = GraphNode::Dictionary(entries);
+
+        let decoded = decode_structured_entitlements(&GraphStructuredReader { nodes }, 0)
+            .expect("bounded common-prefix dictionary should decode");
+        assert_eq!(decoded.len(), 1_500);
+        assert_eq!(
+            decoded.first().map(|entry| entry.key.as_str()),
+            Some("common.prefix.0000")
+        );
+        assert_eq!(
+            decoded.last().map(|entry| entry.key.as_str()),
+            Some("common.prefix.1499")
+        );
+    }
+
+    #[test]
+    fn structured_legacy_blob_classification_is_exact() {
+        let mut xml_blob = vec![0xfa, 0xde, 0x71, 0x71, 0, 0, 0, 0];
+        xml_blob.extend_from_slice(b"<?xml version=\"1.0\"?><plist></plist>");
+        let length = u32::try_from(xml_blob.len()).expect("fixture length fits in u32");
+        xml_blob[4..8].copy_from_slice(&length.to_be_bytes());
+
+        assert_eq!(
+            classify_legacy_entitlement_blob(&xml_blob),
+            Ok(LegacyFormat::Xml)
+        );
+
+        let mut binary_blob = vec![0xfa, 0xde, 0x71, 0x71, 0, 0, 0, 16];
+        binary_blob.extend_from_slice(b"bplist00");
+        assert_eq!(
+            classify_legacy_entitlement_blob(&binary_blob),
+            Ok(LegacyFormat::Binary)
+        );
+    }
+
+    #[test]
+    fn structured_legacy_blob_rejects_bad_framing_and_unknown_payloads() {
+        for blob in [
+            vec![],
+            vec![0xfa, 0xde, 0x71, 0x71, 0, 0, 0],
+            vec![0xfa, 0xde, 0x71, 0x72, 0, 0, 0, 8],
+            vec![0xfa, 0xde, 0x71, 0x71, 0, 0, 0, 9],
+            vec![0xfa, 0xde, 0x71, 0x71, 0, 0, 0, 8],
+        ] {
+            assert!(classify_legacy_entitlement_blob(&blob).is_err());
+        }
+
+        let unknown = legacy_blob(b"not-a-property-list");
+        assert!(classify_legacy_entitlement_blob(&unknown).is_err());
+
+        let non_utf8_xml = legacy_blob(&[0xef, 0xbb, 0xbf, b' ', 0xff, b'<', b'p']);
+        assert!(classify_legacy_entitlement_blob(&non_utf8_xml).is_err());
+    }
+
+    #[test]
+    fn structured_legacy_xml_accepts_one_bom_and_only_ascii_xml_whitespace() {
+        assert_eq!(
+            classify_legacy_entitlement_blob(&legacy_blob(
+                b"\xef\xbb\xbf \t\r\n<?xml version=\"1.0\"?>"
+            )),
+            Ok(LegacyFormat::Xml)
+        );
+        assert_eq!(
+            classify_legacy_entitlement_blob(&legacy_blob(b"\n<plist/>")),
+            Ok(LegacyFormat::Xml)
+        );
+        assert!(
+            classify_legacy_entitlement_blob(&legacy_blob(b"\xef\xbb\xbf\xef\xbb\xbf<plist/>"))
+                .is_err()
+        );
+        assert!(
+            classify_legacy_entitlement_blob(&legacy_blob("\u{00a0}<plist/>".as_bytes())).is_err()
+        );
+    }
+
+    #[test]
+    fn structured_legacy_blob_enforces_the_raw_byte_ceiling() {
+        let mut exact_payload = vec![b'x'; MAX_ENTITLEMENT_BYTES - 8];
+        exact_payload[..8].copy_from_slice(b"bplist00");
+        let exact = legacy_blob(&exact_payload);
+        assert_eq!(exact.len(), MAX_ENTITLEMENT_BYTES);
+        assert_eq!(
+            classify_legacy_entitlement_blob(&exact),
+            Ok(LegacyFormat::Binary)
+        );
+
+        let mut over = exact;
+        over.push(b'x');
+        let length = u32::try_from(over.len()).expect("fixture length fits u32");
+        over[4..8].copy_from_slice(&length.to_be_bytes());
+        assert!(classify_legacy_entitlement_blob(&over).is_err());
+    }
+
+    fn legacy_blob(payload: &[u8]) -> Vec<u8> {
+        let length = 8_usize
+            .checked_add(payload.len())
+            .expect("fixture length does not overflow");
+        let length = u32::try_from(length).expect("fixture length fits u32");
+        let mut blob = vec![0xfa, 0xde, 0x71, 0x71];
+        blob.extend_from_slice(&length.to_be_bytes());
+        blob.extend_from_slice(payload);
+        blob
+    }
 
     fn der_length(length: usize) -> Vec<u8> {
         if length < 128 {

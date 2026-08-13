@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 use crate::macos::command::SystemCommandRunner;
 use crate::macos::command::{NativeCommandError, NativeCommandOutput, NativeCommandRunner};
 use crate::macos::entitlements::{EntitlementEntry, EntitlementSource};
+use crate::macos::security_info::{
+    PreliminarySecurityObservation, SecurityInfoProvider, SelectedSecurityObservation,
+    SelectedSecurityRequest, UnavailableSecurityInfoProvider,
+};
 use crate::scanner::result::{DiagnosticKind, ScanDiagnostic};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1270,17 +1274,47 @@ pub trait CodeSignatureInspector {
     ) -> CodeSignatureInspection;
 }
 
-pub struct CodesignInspector<R: NativeCommandRunner> {
+pub(crate) struct CodesignInspector<R: NativeCommandRunner, S: SecurityInfoProvider> {
     runner: R,
+    security_info_provider: S,
 }
 
-impl<R: NativeCommandRunner> CodesignInspector<R> {
-    pub fn new(runner: R) -> Self {
-        Self { runner }
+impl<R: NativeCommandRunner> CodesignInspector<R, UnavailableSecurityInfoProvider> {
+    pub(crate) fn new(runner: R) -> Self {
+        Self::with_security_info_provider(runner, UnavailableSecurityInfoProvider)
     }
 }
 
-impl<R: NativeCommandRunner> CodeSignatureInspector for CodesignInspector<R> {
+impl<R: NativeCommandRunner, S: SecurityInfoProvider> CodesignInspector<R, S> {
+    pub(crate) fn with_security_info_provider(runner: R, security_info_provider: S) -> Self {
+        Self {
+            runner,
+            security_info_provider,
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolve_bundle_main_security(
+        &self,
+        bundle: &Path,
+    ) -> PreliminarySecurityObservation {
+        self.security_info_provider.resolve_bundle_main(bundle)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn inspect_selected_security(
+        &self,
+        request: &SelectedSecurityRequest<'_>,
+        bind_main: &mut dyn FnMut(&Path) -> Result<(), String>,
+    ) -> SelectedSecurityObservation {
+        self.security_info_provider
+            .inspect_selected(request, bind_main)
+    }
+}
+
+impl<R: NativeCommandRunner, S: SecurityInfoProvider> CodeSignatureInspector
+    for CodesignInspector<R, S>
+{
     fn inspect(
         &self,
         target: &Path,
@@ -1853,15 +1887,16 @@ fn code_signature_diagnostic(target: &Path, message: String) -> ScanDiagnostic {
 }
 
 #[cfg(target_os = "macos")]
-pub type PlatformCodeSignatureInspector = CodesignInspector<SystemCommandRunner>;
+pub(crate) type PlatformCodeSignatureInspector =
+    CodesignInspector<SystemCommandRunner, UnavailableSecurityInfoProvider>;
 
 #[cfg(target_os = "macos")]
-pub fn platform_code_signature_inspector() -> PlatformCodeSignatureInspector {
+pub(crate) fn platform_code_signature_inspector() -> PlatformCodeSignatureInspector {
     CodesignInspector::new(SystemCommandRunner)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub struct PlatformCodeSignatureInspector;
+pub(crate) struct PlatformCodeSignatureInspector;
 
 #[cfg(not(target_os = "macos"))]
 impl CodeSignatureInspector for PlatformCodeSignatureInspector {
@@ -1882,7 +1917,7 @@ impl CodeSignatureInspector for PlatformCodeSignatureInspector {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn platform_code_signature_inspector() -> PlatformCodeSignatureInspector {
+pub(crate) fn platform_code_signature_inspector() -> PlatformCodeSignatureInspector {
     PlatformCodeSignatureInspector
 }
 
@@ -1897,6 +1932,14 @@ mod tests {
 
     use super::*;
     use crate::macos::command::{NativeCommandError, NativeCommandOutput, NativeCommandRunner};
+    use crate::macos::entitlements::{
+        EntitlementValue, LegacyEntitlementObservation, LegacyFormat,
+    };
+    use crate::macos::security_info::{
+        PreliminarySecurityObservation, SecurityInfoProvider, SecurityMetadata,
+        SecurityMetadataObservation, SelectedCodeStatus, SelectedSecurityObservation,
+        SelectedSecurityRequest,
+    };
     use crate::scanner::result::DiagnosticKind;
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1970,6 +2013,76 @@ mod tests {
         }
     }
 
+    struct RecordingSecurityInfoProvider {
+        preliminary: PreliminarySecurityObservation,
+        selected: SelectedSecurityObservation,
+        selected_main: Option<PathBuf>,
+        preliminary_requests: RefCell<Vec<PathBuf>>,
+        requests: RefCell<Vec<(PathBuf, CodeSignatureArchitecture, CodeSignatureTargetKind)>>,
+    }
+
+    impl RecordingSecurityInfoProvider {
+        fn new(selected: SelectedSecurityObservation) -> Self {
+            Self {
+                preliminary: PreliminarySecurityObservation::Error {
+                    reason: "preliminary resolution was not configured".to_string(),
+                },
+                selected,
+                selected_main: None,
+                preliminary_requests: RefCell::new(Vec::new()),
+                requests: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_preliminary(mut self, preliminary: PreliminarySecurityObservation) -> Self {
+            self.preliminary = preliminary;
+            self
+        }
+
+        fn with_selected_main(mut self, selected_main: PathBuf) -> Self {
+            self.selected_main = Some(selected_main);
+            self
+        }
+    }
+
+    impl SecurityInfoProvider for RecordingSecurityInfoProvider {
+        fn resolve_bundle_main(&self, bundle: &Path) -> PreliminarySecurityObservation {
+            self.preliminary_requests
+                .borrow_mut()
+                .push(bundle.to_path_buf());
+            self.preliminary.clone()
+        }
+
+        fn inspect_selected(
+            &self,
+            request: &SelectedSecurityRequest<'_>,
+            bind_main: &mut dyn FnMut(&Path) -> Result<(), String>,
+        ) -> SelectedSecurityObservation {
+            self.requests.borrow_mut().push((
+                request.path.to_path_buf(),
+                request.architecture.clone(),
+                request.target_kind,
+            ));
+
+            if let Some(selected_main) = self.selected_main.as_deref()
+                && let Err(reason) = bind_main(selected_main)
+            {
+                return SelectedSecurityObservation {
+                    status: SelectedCodeStatus::Error {
+                        status: None,
+                        reason: reason.clone(),
+                    },
+                    metadata: SecurityMetadataObservation::Error {
+                        reason: reason.clone(),
+                    },
+                    legacy_entitlements: LegacyEntitlementObservation::Unobserved { reason },
+                };
+            }
+
+            self.selected.clone()
+        }
+    }
+
     struct ReplacingRunner {
         target: PathBuf,
         backup: PathBuf,
@@ -2035,6 +2148,283 @@ mod tests {
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
             .collect()
+    }
+
+    fn passed_metadata(identifier: &str) -> SecurityMetadataObservation {
+        SecurityMetadataObservation::Passed(SecurityMetadata {
+            identifier: identifier.to_string(),
+            team_identifier: Some("TEAM".to_string()),
+            authorities: vec!["Signer".to_string()],
+            ad_hoc: false,
+            hardened_runtime: true,
+        })
+    }
+
+    #[test]
+    fn preliminary_bundle_resolution_is_forwarded_without_exposing_native_details() {
+        let bundle = Path::new("/Applications/Example.app");
+        let main = PathBuf::from("/Applications/Example.app/Contents/MacOS/Example");
+        let provider = RecordingSecurityInfoProvider::new(SelectedSecurityObservation {
+            status: SelectedCodeStatus::Error {
+                status: None,
+                reason: "selected inspection was not configured".to_string(),
+            },
+            metadata: SecurityMetadataObservation::Error {
+                reason: "selected inspection was not configured".to_string(),
+            },
+            legacy_entitlements: LegacyEntitlementObservation::Unobserved {
+                reason: "selected inspection was not configured".to_string(),
+            },
+        })
+        .with_preliminary(PreliminarySecurityObservation::Resolved(main.clone()));
+        let inspector =
+            CodesignInspector::with_security_info_provider(RecordingRunner::new([]), provider);
+
+        let observation = inspector.resolve_bundle_main_security(bundle);
+
+        assert_eq!(observation, PreliminarySecurityObservation::Resolved(main));
+        assert_eq!(
+            inspector
+                .security_info_provider
+                .preliminary_requests
+                .borrow()
+                .as_slice(),
+            [bundle.to_path_buf()]
+        );
+        assert!(
+            inspector
+                .security_info_provider
+                .requests
+                .borrow()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn staged_security_provider_does_not_change_phase_two_inspection() {
+        let directory = TestDirectory::new();
+        let target = directory.file("sample");
+        let runner = RecordingRunner::new([
+            command_output(true, "", "valid\n"),
+            command_output(
+                true,
+                "Identifier=com.example.phase-two\nSignature=adhoc\n",
+                "",
+            ),
+        ]);
+        let provider = RecordingSecurityInfoProvider::new(SelectedSecurityObservation {
+            status: SelectedCodeStatus::Unsigned,
+            metadata: SecurityMetadataObservation::NotApplicable,
+            legacy_entitlements: LegacyEntitlementObservation::Absent,
+        })
+        .with_preliminary(PreliminarySecurityObservation::Error {
+            reason: "must not be observed during Phase 2".to_string(),
+        });
+        let inspector = CodesignInspector::with_security_info_provider(runner, provider);
+
+        let inspection = inspector.inspect(&target, CodeSignatureTargetKind::MachOFile);
+
+        assert_eq!(inspection.presence, SignaturePresence::Signed);
+        assert_eq!(
+            inspection.identifier.as_deref(),
+            Some("com.example.phase-two")
+        );
+        assert_eq!(inspection.signature_kind, SignatureKind::AdHoc);
+        assert!(
+            inspector
+                .security_info_provider
+                .preliminary_requests
+                .borrow()
+                .is_empty()
+        );
+        assert!(
+            inspector
+                .security_info_provider
+                .requests
+                .borrow()
+                .is_empty()
+        );
+        assert_eq!(inspector.runner.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn selected_direct_basic_success_survives_later_copy_failure() {
+        let provider = RecordingSecurityInfoProvider::new(SelectedSecurityObservation {
+            status: SelectedCodeStatus::Signed,
+            metadata: SecurityMetadataObservation::Error {
+                reason: "full signing-information copy failed".to_string(),
+            },
+            legacy_entitlements: LegacyEntitlementObservation::Unobserved {
+                reason: "full signing-information dictionary was not copied".to_string(),
+            },
+        });
+        let inspector =
+            CodesignInspector::with_security_info_provider(RecordingRunner::new([]), provider);
+        let path = Path::new("/tmp/direct-macho");
+        let architecture = CodeSignatureArchitecture::new(0x0100_000c, 0);
+        let request = SelectedSecurityRequest {
+            path,
+            architecture: &architecture,
+            target_kind: CodeSignatureTargetKind::MachOFile,
+        };
+        let mut bind_was_called = false;
+
+        let observation = inspector.inspect_selected_security(&request, &mut |_| {
+            bind_was_called = true;
+            Ok(())
+        });
+
+        assert!(!bind_was_called);
+        assert_eq!(observation.status, SelectedCodeStatus::Signed);
+        assert!(matches!(
+            observation.metadata,
+            SecurityMetadataObservation::Error { .. }
+        ));
+        assert!(matches!(
+            observation.legacy_entitlements,
+            LegacyEntitlementObservation::Unobserved { .. }
+        ));
+    }
+
+    #[test]
+    fn selected_bundle_failure_before_main_binding_discards_positive_observation() {
+        let selected_main = PathBuf::from("/Applications/Example.app/Contents/MacOS/Example");
+        let provider = RecordingSecurityInfoProvider::new(SelectedSecurityObservation {
+            status: SelectedCodeStatus::Signed,
+            metadata: passed_metadata("com.example.app"),
+            legacy_entitlements: LegacyEntitlementObservation::Absent,
+        })
+        .with_selected_main(selected_main.clone());
+        let inspector =
+            CodesignInspector::with_security_info_provider(RecordingRunner::new([]), provider);
+        let bundle = Path::new("/Applications/Example.app");
+        let architecture = CodeSignatureArchitecture::new(0x0100_000c, 0);
+        let request = SelectedSecurityRequest {
+            path: bundle,
+            architecture: &architecture,
+            target_kind: CodeSignatureTargetKind::ApplicationBundle,
+        };
+        let mut bound_path = None;
+
+        let observation = inspector.inspect_selected_security(&request, &mut |path| {
+            bound_path = Some(path.to_path_buf());
+            Err("selected main identity does not match".to_string())
+        });
+
+        assert_eq!(bound_path.as_deref(), Some(selected_main.as_path()));
+        assert!(matches!(
+            observation.status,
+            SelectedCodeStatus::Error { .. }
+        ));
+        assert!(matches!(
+            observation.metadata,
+            SecurityMetadataObservation::Error { .. }
+        ));
+        assert!(matches!(
+            observation.legacy_entitlements,
+            LegacyEntitlementObservation::Unobserved { .. }
+        ));
+    }
+
+    #[test]
+    fn selected_bundle_positive_survives_conversion_failure_after_main_binding() {
+        let selected_main = PathBuf::from("/Applications/Example.app/Contents/MacOS/Example");
+        let provider = RecordingSecurityInfoProvider::new(SelectedSecurityObservation {
+            status: SelectedCodeStatus::Signed,
+            metadata: SecurityMetadataObservation::Error {
+                reason: "required identifier is missing".to_string(),
+            },
+            legacy_entitlements: LegacyEntitlementObservation::Absent,
+        })
+        .with_selected_main(selected_main.clone());
+        let inspector =
+            CodesignInspector::with_security_info_provider(RecordingRunner::new([]), provider);
+        let bundle = Path::new("/Applications/Example.app");
+        let architecture = CodeSignatureArchitecture::new(0x0100_000c, 0);
+        let request = SelectedSecurityRequest {
+            path: bundle,
+            architecture: &architecture,
+            target_kind: CodeSignatureTargetKind::ApplicationBundle,
+        };
+
+        let observation = inspector.inspect_selected_security(&request, &mut |path| {
+            if path == selected_main {
+                Ok(())
+            } else {
+                Err("unexpected selected main".to_string())
+            }
+        });
+
+        assert_eq!(observation.status, SelectedCodeStatus::Signed);
+        assert!(matches!(
+            observation.metadata,
+            SecurityMetadataObservation::Error { .. }
+        ));
+        assert_eq!(
+            observation.legacy_entitlements,
+            LegacyEntitlementObservation::Absent
+        );
+    }
+
+    #[test]
+    fn selected_metadata_and_legacy_observations_remain_independent() {
+        let entries = vec![EntitlementEntry {
+            key: "com.example.compatibility".to_string(),
+            value: EntitlementValue::Boolean(true),
+        }];
+        let metadata_passed = RecordingSecurityInfoProvider::new(SelectedSecurityObservation {
+            status: SelectedCodeStatus::Signed,
+            metadata: passed_metadata("com.example.metadata"),
+            legacy_entitlements: LegacyEntitlementObservation::Invalid {
+                reason: "legacy envelope is malformed".to_string(),
+            },
+        });
+        let legacy_passed = RecordingSecurityInfoProvider::new(SelectedSecurityObservation {
+            status: SelectedCodeStatus::Signed,
+            metadata: SecurityMetadataObservation::Error {
+                reason: "metadata conversion failed".to_string(),
+            },
+            legacy_entitlements: LegacyEntitlementObservation::Valid {
+                format: LegacyFormat::Xml,
+                entries: entries.clone(),
+            },
+        });
+        let path = Path::new("/tmp/direct-macho");
+        let architecture = CodeSignatureArchitecture::new(7, 3);
+        let request = SelectedSecurityRequest {
+            path,
+            architecture: &architecture,
+            target_kind: CodeSignatureTargetKind::MachOFile,
+        };
+
+        let first = CodesignInspector::with_security_info_provider(
+            RecordingRunner::new([]),
+            metadata_passed,
+        )
+        .inspect_selected_security(&request, &mut |_| Ok(()));
+        let second =
+            CodesignInspector::with_security_info_provider(RecordingRunner::new([]), legacy_passed)
+                .inspect_selected_security(&request, &mut |_| Ok(()));
+
+        assert!(matches!(
+            first.metadata,
+            SecurityMetadataObservation::Passed(SecurityMetadata { .. })
+        ));
+        assert!(matches!(
+            first.legacy_entitlements,
+            LegacyEntitlementObservation::Invalid { .. }
+        ));
+        assert!(matches!(
+            second.metadata,
+            SecurityMetadataObservation::Error { .. }
+        ));
+        assert_eq!(
+            second.legacy_entitlements,
+            LegacyEntitlementObservation::Valid {
+                format: LegacyFormat::Xml,
+                entries,
+            }
+        );
     }
 
     #[test]
