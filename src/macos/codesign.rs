@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
@@ -11,6 +13,745 @@ use crate::scanner::result::{DiagnosticKind, ScanDiagnostic};
 pub enum CodeSignatureTargetKind {
     MachOFile,
     ApplicationBundle,
+}
+
+#[cfg(test)]
+mod architecture_tests {
+    use std::cell::RefCell;
+    #[cfg(unix)]
+    use std::fs::{self, File, OpenOptions};
+    use std::io;
+    #[cfg(unix)]
+    use std::io::{Seek, SeekFrom};
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    enum ByteOrder {
+        Big,
+        Little,
+    }
+
+    impl ByteOrder {
+        fn write_i32(self, destination: &mut [u8], value: i32) {
+            destination.copy_from_slice(&match self {
+                Self::Big => value.to_be_bytes(),
+                Self::Little => value.to_le_bytes(),
+            });
+        }
+
+        fn write_u32(self, destination: &mut [u8], value: u32) {
+            destination.copy_from_slice(&match self {
+                Self::Big => value.to_be_bytes(),
+                Self::Little => value.to_le_bytes(),
+            });
+        }
+
+        fn write_u64(self, destination: &mut [u8], value: u64) {
+            destination.copy_from_slice(&match self {
+                Self::Big => value.to_be_bytes(),
+                Self::Little => value.to_le_bytes(),
+            });
+        }
+    }
+
+    fn thin_header(is_64: bool, order: ByteOrder, cpu_type: i32, cpu_subtype: i32) -> Vec<u8> {
+        let header_len = if is_64 { 32 } else { 28 };
+        let magic = match (is_64, order) {
+            (false, ByteOrder::Big) => [0xfe, 0xed, 0xfa, 0xce],
+            (false, ByteOrder::Little) => [0xce, 0xfa, 0xed, 0xfe],
+            (true, ByteOrder::Big) => [0xfe, 0xed, 0xfa, 0xcf],
+            (true, ByteOrder::Little) => [0xcf, 0xfa, 0xed, 0xfe],
+        };
+        let mut bytes = vec![0_u8; header_len];
+        bytes[..4].copy_from_slice(&magic);
+        order.write_i32(&mut bytes[4..8], cpu_type);
+        order.write_i32(&mut bytes[8..12], cpu_subtype);
+        bytes
+    }
+
+    fn fat_magic(is_64: bool, order: ByteOrder) -> [u8; 4] {
+        match (is_64, order) {
+            (false, ByteOrder::Big) => [0xca, 0xfe, 0xba, 0xbe],
+            (false, ByteOrder::Little) => [0xbe, 0xba, 0xfe, 0xca],
+            (true, ByteOrder::Big) => [0xca, 0xfe, 0xba, 0xbf],
+            (true, ByteOrder::Little) => [0xbf, 0xba, 0xfe, 0xca],
+        }
+    }
+
+    #[derive(Clone)]
+    struct FatFixtureEntry {
+        cpu_type: i32,
+        cpu_subtype: i32,
+        offset: u64,
+        size: u64,
+        align: u32,
+        reserved: u32,
+        inner: Vec<u8>,
+    }
+
+    fn fat_file(is_64: bool, order: ByteOrder, entries: &[FatFixtureEntry]) -> Vec<u8> {
+        let entry_size = if is_64 { 32 } else { 20 };
+        let table_end = 8 + entry_size * entries.len();
+        let file_len = entries.iter().fold(table_end, |current, entry| {
+            let end = usize::try_from(entry.offset)
+                .expect("fixture offset fits usize")
+                .checked_add(entry.inner.len())
+                .expect("fixture range fits usize");
+            current.max(end)
+        });
+        let mut bytes = vec![0_u8; file_len];
+        bytes[..4].copy_from_slice(&fat_magic(is_64, order));
+        order.write_u32(
+            &mut bytes[4..8],
+            u32::try_from(entries.len()).expect("fixture entry count fits u32"),
+        );
+
+        for (index, entry) in entries.iter().enumerate() {
+            let start = 8 + index * entry_size;
+            order.write_i32(&mut bytes[start..start + 4], entry.cpu_type);
+            order.write_i32(&mut bytes[start + 4..start + 8], entry.cpu_subtype);
+            if is_64 {
+                order.write_u64(&mut bytes[start + 8..start + 16], entry.offset);
+                order.write_u64(&mut bytes[start + 16..start + 24], entry.size);
+                order.write_u32(&mut bytes[start + 24..start + 28], entry.align);
+                order.write_u32(&mut bytes[start + 28..start + 32], entry.reserved);
+            } else {
+                order.write_u32(
+                    &mut bytes[start + 8..start + 12],
+                    u32::try_from(entry.offset).expect("fat32 fixture offset fits u32"),
+                );
+                order.write_u32(
+                    &mut bytes[start + 12..start + 16],
+                    u32::try_from(entry.size).expect("fat32 fixture size fits u32"),
+                );
+                order.write_u32(&mut bytes[start + 16..start + 20], entry.align);
+            }
+
+            let inner_start = usize::try_from(entry.offset).expect("fixture offset fits usize");
+            let inner_end = inner_start + entry.inner.len();
+            bytes[inner_start..inner_end].copy_from_slice(&entry.inner);
+        }
+
+        bytes
+    }
+
+    fn fat_header_only(is_64: bool, order: ByteOrder, count: u32) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 8];
+        bytes[..4].copy_from_slice(&fat_magic(is_64, order));
+        order.write_u32(&mut bytes[4..8], count);
+        bytes
+    }
+
+    struct ByteReader {
+        bytes: Vec<u8>,
+        reads: RefCell<Vec<(u64, usize)>>,
+    }
+
+    impl ByteReader {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                reads: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PositionalRead for ByteReader {
+        fn file_len(&self) -> io::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+
+        fn read_exact_at(&self, offset: u64, destination: &mut [u8]) -> io::Result<()> {
+            self.reads.borrow_mut().push((offset, destination.len()));
+            let start = usize::try_from(offset)
+                .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "offset"))?;
+            let end = start
+                .checked_add(destination.len())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "range"))?;
+            let source = self
+                .bytes
+                .get(start..end)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "range"))?;
+            destination.copy_from_slice(source);
+            Ok(())
+        }
+    }
+
+    struct SparseReader {
+        len: u64,
+        segments: Vec<(u64, Vec<u8>)>,
+        reads: RefCell<Vec<(u64, usize)>>,
+    }
+
+    impl SparseReader {
+        fn new(len: u64, segments: Vec<(u64, Vec<u8>)>) -> Self {
+            Self {
+                len,
+                segments,
+                reads: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PositionalRead for SparseReader {
+        fn file_len(&self) -> io::Result<u64> {
+            Ok(self.len)
+        }
+
+        fn read_exact_at(&self, offset: u64, destination: &mut [u8]) -> io::Result<()> {
+            self.reads.borrow_mut().push((offset, destination.len()));
+            let requested_end = offset
+                .checked_add(destination.len() as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "range"))?;
+            for (segment_offset, segment) in &self.segments {
+                let segment_end = segment_offset + segment.len() as u64;
+                if offset >= *segment_offset && requested_end <= segment_end {
+                    let start = usize::try_from(offset - segment_offset).expect("relative offset");
+                    destination.copy_from_slice(&segment[start..start + destination.len()]);
+                    return Ok(());
+                }
+            }
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "sparse range"))
+        }
+    }
+
+    fn selection_tuples(selection: &MachOArchitectureSelection) -> Vec<(i32, i32)> {
+        selection
+            .available
+            .iter()
+            .map(|architecture| (architecture.cpu_type, architecture.cpu_subtype))
+            .collect()
+    }
+
+    #[test]
+    fn thin_big_endian_32_architecture_is_selected_from_positional_bytes() {
+        let reader = ByteReader::new(thin_header(false, ByteOrder::Big, 7, 3));
+
+        let selection = parse_macho_architectures(&reader).expect("thin Mach-O should parse");
+
+        assert_eq!(selection.available.len(), 1);
+        assert_eq!(selection.selected.cpu_type, 7);
+        assert_eq!(selection.selected.cpu_subtype, 3);
+        assert_eq!(*reader.reads.borrow(), vec![(0, 4), (0, 28)]);
+    }
+
+    #[test]
+    fn all_thin_magic_and_byte_order_forms_preserve_raw_signed_selectors() {
+        let cases = [
+            (false, ByteOrder::Big, 7, -3, 28),
+            (false, ByteOrder::Little, -7, 0x1020_3040, 28),
+            (true, ByteOrder::Big, i32::MIN, i32::MAX, 32),
+            (true, ByteOrder::Little, 0x0102_0304, -0x0102_0304, 32),
+        ];
+
+        for (is_64, order, cpu_type, cpu_subtype, header_len) in cases {
+            let reader = ByteReader::new(thin_header(is_64, order, cpu_type, cpu_subtype));
+            let selection = parse_macho_architectures(&reader).expect("thin form should parse");
+            assert_eq!(selection_tuples(&selection), vec![(cpu_type, cpu_subtype)]);
+            assert_eq!(
+                selection.selected.codesign_selector(),
+                format!("{cpu_type},{cpu_subtype}")
+            );
+            assert_eq!(*reader.reads.borrow(), vec![(0, 4), (0, header_len)]);
+        }
+    }
+
+    #[test]
+    fn all_fat_magic_forms_accept_independent_inner_orders_and_widths() {
+        let cases = [
+            (false, ByteOrder::Big, true, ByteOrder::Little, 28_u64),
+            (false, ByteOrder::Little, false, ByteOrder::Big, 28_u64),
+            (true, ByteOrder::Big, false, ByteOrder::Little, 40_u64),
+            (true, ByteOrder::Little, true, ByteOrder::Big, 40_u64),
+        ];
+
+        for (fat64, outer_order, thin64, inner_order, offset) in cases {
+            let inner = thin_header(thin64, inner_order, -7, i32::MIN);
+            let entry = FatFixtureEntry {
+                cpu_type: -7,
+                cpu_subtype: i32::MIN,
+                offset,
+                size: inner.len() as u64,
+                align: 0,
+                reserved: 0,
+                inner,
+            };
+            let selection =
+                parse_macho_architectures(&ByteReader::new(fat_file(fat64, outer_order, &[entry])))
+                    .expect("fat form should parse");
+            assert_eq!(selection_tuples(&selection), vec![(-7, i32::MIN)]);
+        }
+    }
+
+    #[test]
+    fn fat_entry_count_is_bounded_before_any_table_read() {
+        for count in [0, 33, u32::MAX] {
+            let reader = ByteReader::new(fat_header_only(false, ByteOrder::Big, count));
+            assert!(parse_macho_architectures(&reader).is_err());
+            assert_eq!(*reader.reads.borrow(), vec![(0, 4), (4, 4)]);
+        }
+    }
+
+    #[test]
+    fn one_and_thirty_two_fat_entries_parse_with_deterministic_signed_sorting() {
+        let one_inner = thin_header(false, ByteOrder::Big, 7, 3);
+        let one = FatFixtureEntry {
+            cpu_type: 7,
+            cpu_subtype: 3,
+            offset: 28,
+            size: 28,
+            align: 0,
+            reserved: 0,
+            inner: one_inner,
+        };
+        let one_selection =
+            parse_macho_architectures(&ByteReader::new(fat_file(false, ByteOrder::Big, &[one])))
+                .expect("one-entry fat should parse");
+        assert_eq!(one_selection.available.len(), 1);
+        assert_eq!(
+            one_selection.native_fact_scope(),
+            NativeFactScope::SingleArchitecture
+        );
+
+        let table_end = 8 + 20 * 32;
+        let entries = (0..32)
+            .map(|index| {
+                let cpu_type = index - 16;
+                let cpu_subtype = 31 - index;
+                FatFixtureEntry {
+                    cpu_type,
+                    cpu_subtype,
+                    offset: (table_end + index as usize * 28) as u64,
+                    size: 28,
+                    align: 0,
+                    reserved: 0,
+                    inner: thin_header(false, ByteOrder::Little, cpu_type, cpu_subtype),
+                }
+            })
+            .rev()
+            .collect::<Vec<_>>();
+        let selection = parse_macho_architectures(&ByteReader::new(fat_file(
+            false,
+            ByteOrder::Little,
+            &entries,
+        )))
+        .expect("32-entry fat should parse");
+        assert_eq!(selection.available.len(), 32);
+        assert_eq!(
+            selection.native_fact_scope(),
+            NativeFactScope::SelectedArchitecture
+        );
+        assert_eq!(selection.selected.cpu_type, -16);
+        assert!(selection.available.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn duplicate_raw_selectors_are_rejected_but_capability_variants_are_distinct() {
+        let table_end = 48_u64;
+        let duplicate = [
+            FatFixtureEntry {
+                cpu_type: 7,
+                cpu_subtype: 3,
+                offset: table_end,
+                size: 28,
+                align: 0,
+                reserved: 0,
+                inner: thin_header(false, ByteOrder::Big, 7, 3),
+            },
+            FatFixtureEntry {
+                cpu_type: 7,
+                cpu_subtype: 3,
+                offset: table_end + 28,
+                size: 28,
+                align: 0,
+                reserved: 0,
+                inner: thin_header(false, ByteOrder::Big, 7, 3),
+            },
+        ];
+        assert!(
+            parse_macho_architectures(&ByteReader::new(fat_file(
+                false,
+                ByteOrder::Big,
+                &duplicate,
+            )))
+            .is_err()
+        );
+
+        let capability = (0x8000_0000_u32 | 3) as i32;
+        let distinct = [
+            duplicate[0].clone(),
+            FatFixtureEntry {
+                cpu_subtype: capability,
+                offset: table_end + 28,
+                inner: thin_header(false, ByteOrder::Little, 7, capability),
+                ..duplicate[1].clone()
+            },
+        ];
+        let selection =
+            parse_macho_architectures(&ByteReader::new(fat_file(false, ByteOrder::Big, &distinct)))
+                .expect("capability-bit variant is a distinct raw selector");
+        assert_eq!(selection_tuples(&selection), vec![(7, capability), (7, 3)]);
+    }
+
+    #[test]
+    fn fat_slice_ranges_are_checked_and_half_open_adjacency_is_valid() {
+        let valid_entries = [
+            FatFixtureEntry {
+                cpu_type: 7,
+                cpu_subtype: 3,
+                offset: 48,
+                size: 28,
+                align: 0,
+                reserved: 0,
+                inner: thin_header(false, ByteOrder::Big, 7, 3),
+            },
+            FatFixtureEntry {
+                cpu_type: 12,
+                cpu_subtype: 0,
+                offset: 76,
+                size: 32,
+                align: 0,
+                reserved: 0,
+                inner: thin_header(true, ByteOrder::Little, 12, 0),
+            },
+        ];
+        assert!(
+            parse_macho_architectures(&ByteReader::new(fat_file(
+                false,
+                ByteOrder::Big,
+                &valid_entries,
+            )))
+            .is_ok()
+        );
+
+        let invalid_ranges = [
+            FatFixtureEntry {
+                size: 0,
+                ..valid_entries[0].clone()
+            },
+            FatFixtureEntry {
+                size: 3,
+                inner: vec![0; 3],
+                ..valid_entries[0].clone()
+            },
+            FatFixtureEntry {
+                offset: 27,
+                ..valid_entries[0].clone()
+            },
+            FatFixtureEntry {
+                size: 29,
+                ..valid_entries[0].clone()
+            },
+        ];
+        for invalid in invalid_ranges {
+            assert!(
+                parse_macho_architectures(&ByteReader::new(fat_file(
+                    false,
+                    ByteOrder::Big,
+                    &[invalid],
+                )))
+                .is_err()
+            );
+        }
+
+        let mut overlapping = valid_entries.clone();
+        overlapping[1].offset = 75;
+        assert!(
+            parse_macho_architectures(&ByteReader::new(fat_file(
+                false,
+                ByteOrder::Big,
+                &overlapping,
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fat_alignment_and_fat64_reserved_are_strict() {
+        let inner = thin_header(false, ByteOrder::Big, 7, 3);
+        let base = FatFixtureEntry {
+            cpu_type: 7,
+            cpu_subtype: 3,
+            offset: 40,
+            size: 28,
+            align: 0,
+            reserved: 0,
+            inner,
+        };
+        assert!(
+            parse_macho_architectures(&ByteReader::new(fat_file(
+                true,
+                ByteOrder::Big,
+                std::slice::from_ref(&base),
+            )))
+            .is_ok()
+        );
+
+        for invalid in [
+            FatFixtureEntry {
+                align: 3,
+                offset: 41,
+                ..base.clone()
+            },
+            FatFixtureEntry {
+                align: 64,
+                ..base.clone()
+            },
+            FatFixtureEntry {
+                align: u32::MAX,
+                ..base.clone()
+            },
+            FatFixtureEntry {
+                reserved: 1,
+                ..base.clone()
+            },
+        ] {
+            assert!(
+                parse_macho_architectures(&ByteReader::new(fat_file(
+                    true,
+                    ByteOrder::Little,
+                    &[invalid],
+                )))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn fat_inner_headers_are_confined_and_bound_to_exact_raw_outer_selectors() {
+        let base = FatFixtureEntry {
+            cpu_type: 7,
+            cpu_subtype: (0x8000_0000_u32 | 3) as i32,
+            offset: 40,
+            size: 32,
+            align: 0,
+            reserved: 0,
+            inner: thin_header(true, ByteOrder::Little, 7, (0x8000_0000_u32 | 3) as i32),
+        };
+
+        for invalid in [
+            FatFixtureEntry {
+                inner: vec![0_u8; 32],
+                ..base.clone()
+            },
+            FatFixtureEntry {
+                inner: fat_header_only(false, ByteOrder::Big, 1),
+                size: 8,
+                ..base.clone()
+            },
+            FatFixtureEntry {
+                size: 31,
+                inner: base.inner[..31].to_vec(),
+                ..base.clone()
+            },
+            FatFixtureEntry {
+                inner: thin_header(true, ByteOrder::Little, 8, base.cpu_subtype),
+                ..base.clone()
+            },
+            FatFixtureEntry {
+                inner: thin_header(true, ByteOrder::Little, 7, 3),
+                ..base.clone()
+            },
+        ] {
+            assert!(
+                parse_macho_architectures(&ByteReader::new(fat_file(
+                    true,
+                    ByteOrder::Big,
+                    &[invalid],
+                )))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn parser_reads_only_outer_table_and_fixed_inner_headers() {
+        let entries = [
+            FatFixtureEntry {
+                cpu_type: 7,
+                cpu_subtype: 3,
+                offset: 48,
+                size: 28,
+                align: 0,
+                reserved: 0,
+                inner: thin_header(false, ByteOrder::Big, 7, 3),
+            },
+            FatFixtureEntry {
+                cpu_type: 12,
+                cpu_subtype: 0,
+                offset: 76,
+                size: 32,
+                align: 0,
+                reserved: 0,
+                inner: thin_header(true, ByteOrder::Little, 12, 0),
+            },
+        ];
+        let reader = ByteReader::new(fat_file(false, ByteOrder::Big, &entries));
+        parse_macho_architectures(&reader).expect("adjacent exact-size slices should parse");
+
+        assert_eq!(
+            *reader.reads.borrow(),
+            vec![
+                (0, 4),
+                (4, 4),
+                (8, 40),
+                (48, 4),
+                (48, 28),
+                (76, 4),
+                (76, 32)
+            ]
+        );
+    }
+
+    #[test]
+    fn truncated_and_unknown_inputs_fail_before_any_out_of_range_read() {
+        let shorter_than_magic = ByteReader::new(vec![0xfe, 0xed, 0xfa]);
+        assert!(parse_macho_architectures(&shorter_than_magic).is_err());
+        assert!(shorter_than_magic.reads.borrow().is_empty());
+
+        let unknown = ByteReader::new(vec![0, 1, 2, 3]);
+        assert!(parse_macho_architectures(&unknown).is_err());
+        assert_eq!(*unknown.reads.borrow(), vec![(0, 4)]);
+
+        let mut short_thin64 = thin_header(true, ByteOrder::Big, 7, 3);
+        short_thin64.pop();
+        let short_thin64 = ByteReader::new(short_thin64);
+        assert!(parse_macho_architectures(&short_thin64).is_err());
+        assert_eq!(*short_thin64.reads.borrow(), vec![(0, 4)]);
+
+        let short_table = ByteReader::new(fat_header_only(false, ByteOrder::Big, 1));
+        assert!(parse_macho_architectures(&short_table).is_err());
+        assert_eq!(*short_table.reads.borrow(), vec![(0, 4), (4, 4)]);
+
+        let full_inner = thin_header(true, ByteOrder::Little, 12, 0);
+        let short_slice = FatFixtureEntry {
+            cpu_type: 12,
+            cpu_subtype: 0,
+            offset: 40,
+            size: 31,
+            align: 0,
+            reserved: 0,
+            inner: full_inner[..31].to_vec(),
+        };
+        let reader = ByteReader::new(fat_file(true, ByteOrder::Big, &[short_slice]));
+        assert!(parse_macho_architectures(&reader).is_err());
+        assert_eq!(
+            *reader.reads.borrow(),
+            vec![(0, 4), (4, 4), (8, 32), (40, 4)]
+        );
+    }
+
+    #[test]
+    fn sparse_fat64_ranges_use_checked_u64_arithmetic_and_alignment() {
+        let high_offset = 1_u64 << 63;
+        let inner = thin_header(false, ByteOrder::Big, 7, 3);
+        let entry = FatFixtureEntry {
+            cpu_type: 7,
+            cpu_subtype: 3,
+            offset: high_offset,
+            size: 28,
+            align: 63,
+            reserved: 0,
+            inner: inner.clone(),
+        };
+        let table = fat_file(
+            true,
+            ByteOrder::Big,
+            &[FatFixtureEntry {
+                offset: 40,
+                inner: Vec::new(),
+                ..entry.clone()
+            }],
+        );
+        let table = table[..40].to_vec();
+        let mut table = table;
+        ByteOrder::Big.write_u64(&mut table[16..24], high_offset);
+        let reader = SparseReader::new(high_offset + 28, vec![(0, table), (high_offset, inner)]);
+        assert!(parse_macho_architectures(&reader).is_ok());
+
+        let overflow_offset = u64::MAX - 10;
+        let mut overflow_table = fat_header_only(true, ByteOrder::Big, 1);
+        overflow_table.resize(40, 0);
+        ByteOrder::Big.write_i32(&mut overflow_table[8..12], 7);
+        ByteOrder::Big.write_i32(&mut overflow_table[12..16], 3);
+        ByteOrder::Big.write_u64(&mut overflow_table[16..24], overflow_offset);
+        ByteOrder::Big.write_u64(&mut overflow_table[24..32], 28);
+        let overflow_reader = SparseReader::new(u64::MAX, vec![(0, overflow_table)]);
+        assert!(parse_macho_architectures(&overflow_reader).is_err());
+        assert_eq!(
+            *overflow_reader.reads.borrow(),
+            vec![(0, 4), (4, 4), (8, 32)]
+        );
+    }
+
+    #[cfg(unix)]
+    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    struct TestDirectory(PathBuf);
+
+    #[cfg(unix)]
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "aegisforge-architecture-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("test directory should be created");
+            Self(path)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_file_handle_ignores_path_replacement_and_preserves_cursor() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = TestDirectory::new();
+        let target = directory.0.join("target");
+        let moved = directory.0.join("original");
+        fs::write(&target, thin_header(false, ByteOrder::Big, 7, 3))
+            .expect("original should be written");
+        let mut retained = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&target)
+            .expect("original should open without following links");
+        retained
+            .seek(SeekFrom::Start(10))
+            .expect("cursor should advance");
+        fs::rename(&target, &moved).expect("original should move");
+        fs::write(&target, thin_header(false, ByteOrder::Little, 12, 0))
+            .expect("replacement should be written");
+
+        let retained_selection =
+            parse_macho_architectures(&retained).expect("retained handle should parse");
+        let replacement = File::open(&target).expect("replacement should open");
+        let replacement_selection =
+            parse_macho_architectures(&replacement).expect("replacement should parse");
+
+        assert_eq!(selection_tuples(&retained_selection), vec![(7, 3)]);
+        assert_eq!(selection_tuples(&replacement_selection), vec![(12, 0)]);
+        assert_eq!(
+            retained
+                .stream_position()
+                .expect("cursor should be readable"),
+            10
+        );
+    }
 }
 
 impl CodeSignatureTargetKind {
@@ -148,6 +889,328 @@ impl CodeSignatureArchitecture {
     pub fn codesign_selector(&self) -> String {
         format!("{},{}", self.cpu_type, self.cpu_subtype)
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+trait PositionalRead {
+    fn file_len(&self) -> io::Result<u64>;
+    fn read_exact_at(&self, offset: u64, destination: &mut [u8]) -> io::Result<()>;
+}
+
+#[cfg(unix)]
+impl PositionalRead for std::fs::File {
+    fn file_len(&self) -> io::Result<u64> {
+        self.metadata().map(|metadata| metadata.len())
+    }
+
+    fn read_exact_at(&self, offset: u64, destination: &mut [u8]) -> io::Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(self, destination, offset)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct MachOArchitectureSelection {
+    selected: CodeSignatureArchitecture,
+    available: Vec<CodeSignatureArchitecture>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl MachOArchitectureSelection {
+    fn native_fact_scope(&self) -> NativeFactScope {
+        if self.available.len() == 1 {
+            NativeFactScope::SingleArchitecture
+        } else {
+            NativeFactScope::SelectedArchitecture
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MachOByteOrder {
+    Big,
+    Little,
+}
+
+impl MachOByteOrder {
+    fn i32(self, bytes: &[u8]) -> i32 {
+        let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        match self {
+            Self::Big => i32::from_be_bytes(bytes),
+            Self::Little => i32::from_le_bytes(bytes),
+        }
+    }
+
+    fn u32(self, bytes: &[u8]) -> u32 {
+        let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        match self {
+            Self::Big => u32::from_be_bytes(bytes),
+            Self::Little => u32::from_le_bytes(bytes),
+        }
+    }
+
+    fn u64(self, bytes: &[u8]) -> u64 {
+        let bytes = [
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ];
+        match self {
+            Self::Big => u64::from_be_bytes(bytes),
+            Self::Little => u64::from_le_bytes(bytes),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MachOContainer {
+    Thin {
+        order: MachOByteOrder,
+        header_len: usize,
+    },
+    Fat {
+        order: MachOByteOrder,
+        entry_len: usize,
+    },
+}
+
+fn classify_macho_magic(magic: [u8; 4]) -> Option<MachOContainer> {
+    match magic {
+        [0xfe, 0xed, 0xfa, 0xce] => Some(MachOContainer::Thin {
+            order: MachOByteOrder::Big,
+            header_len: 28,
+        }),
+        [0xce, 0xfa, 0xed, 0xfe] => Some(MachOContainer::Thin {
+            order: MachOByteOrder::Little,
+            header_len: 28,
+        }),
+        [0xfe, 0xed, 0xfa, 0xcf] => Some(MachOContainer::Thin {
+            order: MachOByteOrder::Big,
+            header_len: 32,
+        }),
+        [0xcf, 0xfa, 0xed, 0xfe] => Some(MachOContainer::Thin {
+            order: MachOByteOrder::Little,
+            header_len: 32,
+        }),
+        [0xca, 0xfe, 0xba, 0xbe] => Some(MachOContainer::Fat {
+            order: MachOByteOrder::Big,
+            entry_len: 20,
+        }),
+        [0xbe, 0xba, 0xfe, 0xca] => Some(MachOContainer::Fat {
+            order: MachOByteOrder::Little,
+            entry_len: 20,
+        }),
+        [0xca, 0xfe, 0xba, 0xbf] => Some(MachOContainer::Fat {
+            order: MachOByteOrder::Big,
+            entry_len: 32,
+        }),
+        [0xbf, 0xba, 0xfe, 0xca] => Some(MachOContainer::Fat {
+            order: MachOByteOrder::Little,
+            entry_len: 32,
+        }),
+        _ => None,
+    }
+}
+
+fn read_macho_range<R: PositionalRead>(
+    reader: &R,
+    file_len: u64,
+    offset: u64,
+    destination: &mut [u8],
+) -> Result<(), String> {
+    let length = u64::try_from(destination.len())
+        .map_err(|_| "Mach-O read length is not representable".to_string())?;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| "Mach-O read range overflowed".to_string())?;
+    if end > file_len {
+        return Err("Mach-O read range extends beyond the retained file".to_string());
+    }
+    reader
+        .read_exact_at(offset, destination)
+        .map_err(|error| format!("failed to read retained Mach-O bytes: {error}"))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FatArchitectureEntry {
+    cpu_type: i32,
+    cpu_subtype: i32,
+    offset: u64,
+    size: u64,
+    end: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_macho_architectures<R: PositionalRead>(
+    reader: &R,
+) -> Result<MachOArchitectureSelection, String> {
+    let file_len = reader
+        .file_len()
+        .map_err(|error| format!("failed to inspect retained Mach-O length: {error}"))?;
+    let mut magic = [0_u8; 4];
+    read_macho_range(reader, file_len, 0, &mut magic)?;
+    let container = classify_macho_magic(magic)
+        .ok_or_else(|| "retained file does not have a supported Mach-O magic".to_string())?;
+
+    match container {
+        MachOContainer::Thin { order, header_len } => {
+            let mut header = [0_u8; 32];
+            read_macho_range(reader, file_len, 0, &mut header[..header_len])?;
+            let architecture =
+                CodeSignatureArchitecture::new(order.i32(&header[4..8]), order.i32(&header[8..12]));
+            Ok(MachOArchitectureSelection {
+                selected: architecture.clone(),
+                available: vec![architecture],
+            })
+        }
+        MachOContainer::Fat { order, entry_len } => {
+            parse_fat_macho_architectures(reader, file_len, order, entry_len)
+        }
+    }
+}
+
+fn parse_fat_macho_architectures<R: PositionalRead>(
+    reader: &R,
+    file_len: u64,
+    order: MachOByteOrder,
+    entry_len: usize,
+) -> Result<MachOArchitectureSelection, String> {
+    const MAX_ARCHITECTURES: usize = 32;
+    const MAX_TABLE_BYTES: usize = MAX_ARCHITECTURES * 32;
+
+    let mut count_bytes = [0_u8; 4];
+    read_macho_range(reader, file_len, 4, &mut count_bytes)?;
+    let count = usize::try_from(order.u32(&count_bytes))
+        .map_err(|_| "fat Mach-O architecture count is not representable".to_string())?;
+    if !(1..=MAX_ARCHITECTURES).contains(&count) {
+        return Err(format!(
+            "fat Mach-O architecture count must be in 1..={MAX_ARCHITECTURES}"
+        ));
+    }
+
+    let table_bytes = entry_len
+        .checked_mul(count)
+        .ok_or_else(|| "fat Mach-O table length overflowed".to_string())?;
+    let table_end = 8_u64
+        .checked_add(
+            u64::try_from(table_bytes)
+                .map_err(|_| "fat Mach-O table length is not representable".to_string())?,
+        )
+        .ok_or_else(|| "fat Mach-O table range overflowed".to_string())?;
+    if table_end > file_len {
+        return Err("fat Mach-O table extends beyond the retained file".to_string());
+    }
+
+    let mut table = [0_u8; MAX_TABLE_BYTES];
+    read_macho_range(reader, file_len, 8, &mut table[..table_bytes])?;
+    let mut entries = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = index * entry_len;
+        let encoded = &table[start..start + entry_len];
+        let cpu_type = order.i32(&encoded[0..4]);
+        let cpu_subtype = order.i32(&encoded[4..8]);
+        let (offset, size, align) = if entry_len == 20 {
+            (
+                u64::from(order.u32(&encoded[8..12])),
+                u64::from(order.u32(&encoded[12..16])),
+                order.u32(&encoded[16..20]),
+            )
+        } else {
+            let reserved = order.u32(&encoded[28..32]);
+            if reserved != 0 {
+                return Err("fat64 Mach-O architecture has a nonzero reserved field".to_string());
+            }
+            (
+                order.u64(&encoded[8..16]),
+                order.u64(&encoded[16..24]),
+                order.u32(&encoded[24..28]),
+            )
+        };
+
+        if size == 0 {
+            return Err("fat Mach-O architecture slice is empty".to_string());
+        }
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| "fat Mach-O architecture range overflowed".to_string())?;
+        if offset < table_end {
+            return Err("fat Mach-O architecture overlaps its table".to_string());
+        }
+        if end > file_len {
+            return Err("fat Mach-O architecture extends beyond the retained file".to_string());
+        }
+        let alignment = 1_u64
+            .checked_shl(align)
+            .ok_or_else(|| "fat Mach-O architecture alignment is invalid".to_string())?;
+        if offset % alignment != 0 {
+            return Err("fat Mach-O architecture offset is misaligned".to_string());
+        }
+
+        entries.push(FatArchitectureEntry {
+            cpu_type,
+            cpu_subtype,
+            offset,
+            size,
+            end,
+        });
+    }
+
+    let mut ranges = entries
+        .iter()
+        .map(|entry| (entry.offset, entry.end))
+        .collect::<Vec<_>>();
+    ranges.sort_unstable();
+    if ranges.windows(2).any(|range| range[1].0 < range[0].1) {
+        return Err("fat Mach-O architecture slices overlap".to_string());
+    }
+
+    let mut selectors = BTreeSet::new();
+    let mut architectures = Vec::with_capacity(count);
+    for entry in entries {
+        if entry.size < 4 {
+            return Err("fat Mach-O architecture is too small for a magic".to_string());
+        }
+        let mut inner_magic = [0_u8; 4];
+        read_macho_range(reader, file_len, entry.offset, &mut inner_magic)?;
+        let (inner_order, inner_header_len) = match classify_macho_magic(inner_magic) {
+            Some(MachOContainer::Thin { order, header_len }) => (order, header_len),
+            _ => return Err("fat Mach-O entry does not contain a thin Mach-O".to_string()),
+        };
+        if entry.size
+            < u64::try_from(inner_header_len)
+                .map_err(|_| "Mach-O header length is not representable".to_string())?
+        {
+            return Err("fat Mach-O slice is smaller than its thin header".to_string());
+        }
+
+        let mut inner_header = [0_u8; 32];
+        read_macho_range(
+            reader,
+            file_len,
+            entry.offset,
+            &mut inner_header[..inner_header_len],
+        )?;
+        let inner_cpu_type = inner_order.i32(&inner_header[4..8]);
+        let inner_cpu_subtype = inner_order.i32(&inner_header[8..12]);
+        if (entry.cpu_type, entry.cpu_subtype) != (inner_cpu_type, inner_cpu_subtype) {
+            return Err("fat Mach-O selector does not match its inner thin header".to_string());
+        }
+        if !selectors.insert((entry.cpu_type, entry.cpu_subtype)) {
+            return Err("fat Mach-O contains a duplicate raw architecture selector".to_string());
+        }
+        architectures.push(CodeSignatureArchitecture::new(
+            entry.cpu_type,
+            entry.cpu_subtype,
+        ));
+    }
+
+    architectures.sort();
+    let selected = architectures
+        .first()
+        .cloned()
+        .ok_or_else(|| "fat Mach-O has no architecture to select".to_string())?;
+    Ok(MachOArchitectureSelection {
+        selected,
+        available: architectures,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
